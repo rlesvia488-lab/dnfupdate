@@ -56,7 +56,8 @@ public final class DnfUpdateApp {
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
     private static final String STATUS_LOG_FILE = "status-checks.tsv";
     private static final String REPORT_DIR = "reports";
-    private static final long REBOOT_WAIT_MILLIS = 5 * 60 * 1000L;
+    private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
+    private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
     private static final List<String> HEALTHCHECK_URLS = List.of(
             "http://127.0.0.1:8080/actuator/health",
@@ -415,7 +416,7 @@ public final class DnfUpdateApp {
             runRemote(job, host, session, "sync");
             if (job.settings.reboot) {
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
-                job.add(host, "info", "After the reboot command is sent, the app will wait 5 minutes before reconnecting.");
+                job.add(host, "info", "After the reboot command is sent, the app will check SSH every 10 seconds for up to 5 minutes.");
                 runRemote(job, host, session, "sudo -n sh -c 'nohup sh -c \"sleep 2; systemctl reboot -i || reboot\" >/dev/null 2>&1 &'", true);
                 session.disconnect();
                 session = null;
@@ -447,12 +448,36 @@ public final class DnfUpdateApp {
     }
 
     private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report) {
-        job.add(host, "info", "Waiting 5 minutes before post-reboot SSH verification.");
-        sleep(REBOOT_WAIT_MILLIS);
-
         Session verificationSession = null;
+        long deadline = System.currentTimeMillis() + REBOOT_VERIFY_TIMEOUT_MILLIS;
+        int attempt = 1;
+        Exception lastFailure = null;
+        job.add(host, "info", "Starting post-reboot SSH checks every 10 seconds for up to 5 minutes.");
+        while (System.currentTimeMillis() <= deadline) {
+            try {
+                job.add(host, "info", "Post-reboot SSH check attempt " + attempt + ".");
+                verificationSession = connect(job, host);
+                break;
+            } catch (Exception e) {
+                lastFailure = e;
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                sleep(Math.min(REBOOT_VERIFY_INTERVAL_MILLIS, remaining));
+                attempt++;
+            }
+        }
+
+        if (verificationSession == null) {
+            report.machineUpAfterReboot = false;
+            report.serviceUpAfterReboot = false;
+            job.add(host, "error", "Server was not reachable over SSH within 5 minutes after reboot. Last error: "
+                    + (lastFailure == null ? "timeout" : cleanMessage(lastFailure)));
+            return new PostRebootStatus(false, false, Optional.empty());
+        }
+
         try {
-            verificationSession = connect(job, host);
             report.machineUpAfterReboot = true;
             job.add(host, "success", "Server is reachable over SSH after reboot.");
 
@@ -472,10 +497,10 @@ public final class DnfUpdateApp {
             job.add(host, "error", "Server is reachable, but none of the configured health checks returned HTTP 200.");
             return new PostRebootStatus(true, false, Optional.empty());
         } catch (Exception e) {
-            report.machineUpAfterReboot = false;
+            report.machineUpAfterReboot = true;
             report.serviceUpAfterReboot = false;
-            job.add(host, "error", "Server is not reachable over SSH after reboot wait: " + cleanMessage(e));
-            return new PostRebootStatus(false, false, Optional.empty());
+            job.add(host, "error", "Server is reachable, but health check execution failed: " + cleanMessage(e));
+            return new PostRebootStatus(true, false, Optional.empty());
         } finally {
             if (verificationSession != null) {
                 verificationSession.disconnect();
