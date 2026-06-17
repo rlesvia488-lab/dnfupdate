@@ -1,0 +1,37 @@
+Manifest-Version: 1.0
+Created-By: Maven JAR Plugin 3.4.2
+Build-Jdk-Spec: 21
+Specification-Title: JSch
+Specification-Version: 0.2
+Implementation-Title: JSch
+Implementation-Version: 0.2.24
+Multi-Release: true
+Bundle-Description: JSch is a pure Java implementation of SSH2
+Bundle-License: "Revised BSD";link="https://github.com/mwiede/jsch/blob/
+ master/LICENSE.txt","Revised BSD";link="https://github.com/mwiede/jsch/
+ blob/master/LICENSE.JZlib.txt",ISC;link="https://github.com/mwiede/jsch
+ /blob/master/LICENSE.jBCrypt.txt"
+Bundle-ManifestVersion: 2
+Bundle-Name: JSch
+Bundle-SymbolicName: com.github.mwiede.jsch
+Bundle-Version: 0.2.24
+Export-Package: com.jcraft.jsch;version="0.2.24"
+Import-Package: com.sun.jna;version="[5.0,6)";resolution:=optional,com.s
+ un.jna.platform.win32;version="[5.0,6)";resolution:=optional,org.apache
+ .logging.log4j;version="[2.0,4)";resolution:=optional,org.bouncycastle.
+ crypto;version="[1.79,2)";resolution:=optional,org.bouncycastle.crypto.
+ digests;version="[1.79,2)";resolution:=optional,org.bouncycastle.crypto
+ .engines;version="[1.79,2)";resolution:=optional,org.bouncycastle.crypt
+ o.generators;version="[1.79,2)";resolution:=optional,org.bouncycastle.c
+ rypto.macs;version="[1.79,2)";resolution:=optional,org.bouncycastle.cry
+ pto.modes;version="[1.79,2)";resolution:=optional,org.bouncycastle.cryp
+ to.params;version="[1.79,2)";resolution:=optional,org.bouncycastle.cryp
+ to.signers;version="[1.79,2)";resolution:=optional,org.bouncycastle.pqc
+ .crypto.mlkem;version="[1.79,2)";resolution:=optional,org.bouncycastle.
+ pqc.crypto.ntruprime;version="[1.79,2)";resolution:=optional,org.slf4j;
+ version="[1.7,3)";resolution:=optional,org.newsclub.net.unix;resolution
+ :=optional,org.ietf.jgss;resolution:=optional,javax.crypto,javax.crypto
+ .interfaces,javax.crypto.spec
+Require-Capability: osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=1.8))"
+Tool: Bnd-7.1.0.202411251545
+
