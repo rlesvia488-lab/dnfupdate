@@ -211,7 +211,8 @@ public final class DnfUpdateApp {
                 clamp(parseInt(form.get("concurrency")).orElse(3), 1, 20),
                 "on".equals(form.get("reboot")),
                 "on".equals(form.get("makecache")),
-                "on".equals(form.get("skipBroken"))
+                "on".equals(form.get("skipBroken")),
+                "on".equals(form.get("dryRun"))
         );
 
         Job job = new Job(UUID.randomUUID().toString(), hosts, settings, authorizedMember.get());
@@ -296,8 +297,8 @@ public final class DnfUpdateApp {
     }
 
     private void runJob(Job job) {
-        job.add("system", "info", "Started job for " + job.hosts.size() + " server(s).");
-        job.add("system", "info", "Patch authorized by " + job.authorizedMember + " for servers: " + String.join(", ", job.hosts));
+        job.add("system", "info", "Started " + (job.settings.dryRun ? "dry run" : "patch job") + " for " + job.hosts.size() + " server(s).");
+        job.add("system", "info", (job.settings.dryRun ? "Dry run" : "Patch") + " authorized by " + job.authorizedMember + " for servers: " + String.join(", ", job.hosts));
         Semaphore semaphore = new Semaphore(job.settings.concurrency);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
@@ -338,15 +339,21 @@ public final class DnfUpdateApp {
         try {
             session = connect(job, host);
             runRemote(job, host, session, "hostnamectl || hostname");
-            if (job.settings.makecache) {
+            if (job.settings.makecache && !job.settings.dryRun) {
                 runRemote(job, host, session, "sudo -n dnf -y makecache --refresh");
             }
             RemoteResult beforeSecurity = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --updates", true);
             report.rhsaPresentBefore.addAll(extractRhsa(beforeSecurity.lines()));
             if (report.rhsaPresentBefore.isEmpty()) {
-                job.add(host, "info", "No RHSA security advisories were listed before patching.");
+                job.add(host, "info", "No RHSA security advisories are currently available to install.");
             } else {
-                job.add(host, "info", "RHSA present before patching: " + String.join(", ", report.rhsaPresentBefore));
+                job.add(host, "info", "RHSA available to install: " + String.join(", ", report.rhsaPresentBefore));
+            }
+            if (job.settings.dryRun) {
+                RemoteResult installedOnly = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --installed", true);
+                report.rhsaInstalledAfter.addAll(extractRhsa(installedOnly.lines()));
+                job.succeed(host, "Dry run finished. No update or reboot commands were executed.");
+                return;
             }
             String updateCommand = "sudo -n dnf -y update --security";
             if (job.settings.skipBroken) {
@@ -526,13 +533,15 @@ public final class DnfUpdateApp {
                 <body>
                 <main>
                 """);
-        html.append("<h1>DNF Patch Report</h1>");
+        html.append("<h1>").append(job.settings.dryRun ? "DNF Dry Run Report" : "DNF Patch Report").append("</h1>");
         html.append("<div class=\"meta\">")
                 .append("<div><b>Run ID:</b> ").append(escapeHtml(job.id)).append("</div>")
+                .append("<div><b>Run type:</b> ").append(job.settings.dryRun ? "Dry run" : "Patch").append("</div>")
                 .append("<div><b>Started:</b> ").append(escapeHtml(REPORT_DISPLAY_CLOCK.format(job.startedAt))).append("</div>")
                 .append("<div><b>Authorized member:</b> ").append(escapeHtml(job.authorizedMember)).append("</div>")
-                .append("<div><b>Command:</b> sudo -n dnf -y update --security")
-                .append(job.settings.skipBroken ? " --skip-broken" : "")
+                .append("<div><b>Command:</b> ")
+                .append(job.settings.dryRun ? "dry run only; no update command executed" : "sudo -n dnf -y update --security")
+                .append(!job.settings.dryRun && job.settings.skipBroken ? " --skip-broken" : "")
                 .append("</div>")
                 .append("</div>");
 
@@ -540,12 +549,12 @@ public final class DnfUpdateApp {
                 .append(stat("Total", job.hosts.size()))
                 .append(stat("Succeeded", job.succeeded.get()))
                 .append(stat("Failed", job.failed.get()))
-                .append(stat("Reboot Requested", job.settings.reboot ? "Yes" : "No"))
+                .append(stat("Reboot Requested", !job.settings.dryRun && job.settings.reboot ? "Yes" : "No"))
                 .append("</div>");
 
         html.append("<h2>Server Status And RHSA</h2>");
         html.append("<table><thead><tr>")
-                .append("<th>Server</th><th>Status</th><th>RHSA Present Before</th><th>RHSA Corrected / Installed</th><th>Installed Security RHSA After</th>")
+                .append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th>")
                 .append("</tr></thead><tbody>");
         List<String> sortedHosts = new ArrayList<>(job.hosts);
         Collections.sort(sortedHosts);
@@ -811,7 +820,8 @@ public final class DnfUpdateApp {
             int concurrency,
             boolean reboot,
             boolean makecache,
-            boolean skipBroken
+            boolean skipBroken,
+            boolean dryRun
     ) {
     }
 
@@ -1166,6 +1176,7 @@ public final class DnfUpdateApp {
                         </div>
                         <label class="check"><input type="checkbox" name="makecache" checked> Refresh DNF cache first</label>
                         <label class="check"><input type="checkbox" name="skipBroken"> Add --skip-broken</label>
+                        <label class="check"><input id="dryRun" type="checkbox" name="dryRun"> Dry run report only</label>
                         <label class="check"><input type="checkbox" name="reboot" checked> Reboot after update</label>
                         <button id="runButton" type="submit">Start Update</button>
                       </form>
@@ -1185,6 +1196,7 @@ public final class DnfUpdateApp {
                     const form = document.getElementById('jobForm');
                     const logs = document.getElementById('logs');
                     const runButton = document.getElementById('runButton');
+                    const dryRun = document.getElementById('dryRun');
                     const hostsView = document.getElementById('hostsView');
                     const counts = {
                       total: document.getElementById('total'),
@@ -1193,6 +1205,10 @@ public final class DnfUpdateApp {
                       failed: document.getElementById('failed')
                     };
                     let source = null;
+
+                    dryRun.addEventListener('change', () => {
+                      runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';
+                    });
 
                     function appendLine(event) {
                       const row = document.createElement('div');
@@ -1229,7 +1245,7 @@ public final class DnfUpdateApp {
                       logs.innerHTML = '';
                       hostsView.innerHTML = '';
                       runButton.disabled = true;
-                      runButton.textContent = 'Running...';
+                      runButton.textContent = dryRun.checked ? 'Dry Run Running...' : 'Running...';
                       try {
                         const response = await fetch('/api/start', {
                           method: 'POST',
@@ -1243,7 +1259,7 @@ public final class DnfUpdateApp {
                           updateSummary(JSON.parse(message.data));
                           source.close();
                           runButton.disabled = false;
-                          runButton.textContent = 'Start Update';
+                          runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';
                         });
                         source.onerror = () => {
                           appendLine({time: new Date().toLocaleTimeString(), host: 'ui', level: 'warn', message: 'Live connection dropped. The backend job may still be running.'});
@@ -1259,7 +1275,7 @@ public final class DnfUpdateApp {
                       } catch (error) {
                         appendLine({time: new Date().toLocaleTimeString(), host: 'ui', level: 'error', message: error.message});
                         runButton.disabled = false;
-                        runButton.textContent = 'Start Update';
+                        runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';
                       }
                     });
                   </script>

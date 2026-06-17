@@ -42,7 +42,9 @@ Each completed run also creates a timestamped HTML report beside the JAR:
 reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html
 ```
 
-The report includes each server's patching status, RHSA advisories present before patching, RHSA advisories confirmed as installed/corrected after patching, and the full installed security RHSA set observed after the update.
+The report includes each server's status, RHSA advisories available to install, RHSA advisories corrected by the run, and all installed RHSA advisories reported by the OS.
+
+Dry run mode generates the report without running `dnf update`, `sync`, `needs-restarting`, or reboot commands. It only checks what RHSA advisories are available to install and what RHSA advisories are already installed in the OS.
 
 To browse reports from the app, open:
 
@@ -79,6 +81,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Success and failure counters
 - Optional DNF cache refresh
 - Optional `--skip-broken`
+- Dry run report mode with no patching or reboot
 - Required patch passphrase
 - Timestamped HTML report after each run
 - `/patching` report browser ordered by date
