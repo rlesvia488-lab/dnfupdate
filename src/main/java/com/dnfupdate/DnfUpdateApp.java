@@ -96,6 +96,7 @@ public final class DnfUpdateApp {
         DnfUpdateApp app = new DnfUpdateApp(appDir);
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/patching", app::handlePatching);
+        server.createContext("/dryrun", app::handleDryRunReports);
         server.createContext("/reports", app::handleReportFile);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
@@ -133,7 +134,15 @@ public final class DnfUpdateApp {
             send(exchange, 405, "text/plain", "Method not allowed");
             return;
         }
-        send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex());
+        send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.PATCH));
+    }
+
+    private void handleDryRunReports(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "text/plain", "Method not allowed");
+            return;
+        }
+        send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.DRY_RUN));
     }
 
     private void handleReportFile(HttpExchange exchange) throws IOException {
@@ -495,7 +504,8 @@ public final class DnfUpdateApp {
     private Path writeHtmlReport(Job job) throws IOException {
         Path reportsDir = appDir.resolve(REPORT_DIR).normalize();
         Files.createDirectories(reportsDir);
-        Path reportPath = reportsDir.resolve("patch-report-" + REPORT_FILE_CLOCK.format(job.startedAt)
+        String prefix = job.settings.dryRun ? "dryrun-report-" : "patch-report-";
+        Path reportPath = reportsDir.resolve(prefix + REPORT_FILE_CLOCK.format(job.startedAt)
                 + "-" + job.id.substring(0, 8) + ".html");
         Files.writeString(reportPath, buildHtmlReport(job), StandardCharsets.UTF_8);
         return reportPath;
@@ -553,9 +563,13 @@ public final class DnfUpdateApp {
                 .append("</div>");
 
         html.append("<h2>Server Status And RHSA</h2>");
-        html.append("<table><thead><tr>")
-                .append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th>")
-                .append("</tr></thead><tbody>");
+        html.append("<table><thead><tr>");
+        if (job.settings.dryRun) {
+            html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
+        } else {
+            html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th>");
+        }
+        html.append("</tr></thead><tbody>");
         List<String> sortedHosts = new ArrayList<>(job.hosts);
         Collections.sort(sortedHosts);
         for (String host : sortedHosts) {
@@ -564,9 +578,11 @@ public final class DnfUpdateApp {
             html.append("<tr>")
                     .append("<td>").append(escapeHtml(host)).append("</td>")
                     .append("<td class=\"").append(escapeHtml(status)).append("\">").append(escapeHtml(status)).append("</td>")
-                    .append("<td>").append(advisoryList(report.rhsaPresentBefore)).append("</td>")
-                    .append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>")
-                    .append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>")
+                    .append("<td>").append(advisoryList(report.rhsaPresentBefore)).append("</td>");
+            if (!job.settings.dryRun) {
+                html.append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>");
+            }
+            html.append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>")
                     .append("</tr>");
         }
         html.append("</tbody></table>");
@@ -578,13 +594,15 @@ public final class DnfUpdateApp {
         return html.toString();
     }
 
-    private String buildReportsIndex() throws IOException {
+    private String buildReportsIndex(ReportKind kind) throws IOException {
         Path reportsDir = appDir.resolve(REPORT_DIR).normalize();
         Files.createDirectories(reportsDir);
         List<ReportEntry> reports = new ArrayList<>();
+        String reportPrefix = kind == ReportKind.DRY_RUN ? "dryrun-report-" : "patch-report-";
         try (var stream = Files.list(reportsDir)) {
             stream.filter(Files::isRegularFile)
                     .filter(path -> path.getFileName().toString().endsWith(".html"))
+                    .filter(path -> path.getFileName().toString().startsWith(reportPrefix))
                     .forEach(path -> {
                         try {
                             reports.add(new ReportEntry(
@@ -607,7 +625,7 @@ public final class DnfUpdateApp {
                 <head>
                   <meta charset="utf-8">
                   <meta name="viewport" content="width=device-width, initial-scale=1">
-                  <title>Patch Reports</title>
+                  <title>Reports</title>
                   <style>
                     body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #f4f7fb; }
                     main { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 24px 0; }
@@ -627,14 +645,21 @@ public final class DnfUpdateApp {
                 <main>
                   <header>
                     <div>
-                      <h1>Patch Reports</h1>
+                      <h1>__REPORT_TITLE__</h1>
                       <div class="muted">Newest reports first</div>
                     </div>
-                    <a class="button" href="/">Update Console</a>
+                    <div>
+                      <a class="button" href="/">Update Console</a>
+                      <a class="button" href="__OTHER_ROUTE__">__OTHER_LABEL__</a>
+                    </div>
                   </header>
-                """);
+                """.replace("__REPORT_TITLE__", kind == ReportKind.DRY_RUN ? "Dry Run Reports" : "Patch Reports")
+                .replace("__OTHER_ROUTE__", kind == ReportKind.DRY_RUN ? "/patching" : "/dryrun")
+                .replace("__OTHER_LABEL__", kind == ReportKind.DRY_RUN ? "Patch Reports" : "Dry Run Reports"));
         if (reports.isEmpty()) {
-            html.append("<div class=\"empty\">No patch reports have been generated yet.</div>");
+            html.append("<div class=\"empty\">No ")
+                    .append(kind == ReportKind.DRY_RUN ? "dry run" : "patch")
+                    .append(" reports have been generated yet.</div>");
         } else {
             html.append("<table><thead><tr><th>Report</th><th>Date</th><th>Size</th></tr></thead><tbody>");
             for (ReportEntry report : reports) {
@@ -832,6 +857,11 @@ public final class DnfUpdateApp {
     }
 
     private record ReportEntry(String name, Instant modifiedAt, long size) {
+    }
+
+    private enum ReportKind {
+        PATCH,
+        DRY_RUN
     }
 
     private static final class HostReport {
@@ -1128,7 +1158,7 @@ public final class DnfUpdateApp {
                         <h1>DNF Security Update Console</h1>
                         <div class="subtitle">Runs <code>dnf update --security</code> over SSH, streams progress, then reboots selected servers.</div>
                       </div>
-                      <div class="subtitle"><a href="/patching">Patch reports</a> · Keys are loaded from the JAR folder</div>
+                      <div class="subtitle"><a href="/patching">Patch reports</a> · <a href="/dryrun">Dry run reports</a> · Keys are loaded from the JAR folder</div>
                     </div>
                   </header>
                   <main class="wrap">

@@ -42,9 +42,22 @@ Each completed run also creates a timestamped HTML report beside the JAR:
 reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html
 ```
 
-The report includes each server's status, RHSA advisories available to install, RHSA advisories corrected by the run, and all installed RHSA advisories reported by the OS.
+Patch reports include each server's status, RHSA advisories available to install, RHSA advisories corrected by the run, and all installed RHSA advisories reported by the OS.
 
 Dry run mode generates the report without running `dnf update`, `sync`, `needs-restarting`, or reboot commands. It only checks what RHSA advisories are available to install and what RHSA advisories are already installed in the OS.
+
+Dry run reports are saved as:
+
+```text
+reports\dryrun-report-YYYYMMDD-HHMMSS-<run-id>.html
+```
+
+Dry run report columns are:
+
+- Server
+- Status
+- RHSA Available To Install
+- All Installed RHSA In The OS
 
 To browse reports from the app, open:
 
@@ -52,7 +65,13 @@ To browse reports from the app, open:
 http://localhost:8080/patching
 ```
 
-Reports are listed newest first and can be opened directly from that page.
+Dry run reports are available at:
+
+```text
+http://localhost:8080/dryrun
+```
+
+Reports are listed newest first and can be opened directly from those pages.
 
 To use another port:
 
@@ -70,6 +89,7 @@ java -jar dnf-security-update-console.jar
 - Reboot: enabled by default
 - Audit log: `patch-audit.log`
 - HTML reports: `reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html`
+- Dry run reports: `reports\dryrun-report-YYYYMMDD-HHMMSS-<run-id>.html`
 
 The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
 
@@ -85,6 +105,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Required patch passphrase
 - Timestamped HTML report after each run
 - `/patching` report browser ordered by date
+- `/dryrun` dry run report browser ordered by date
 - Configurable SSH port, timeout, key filenames, and parallel server count
 
 # dnfupdate
