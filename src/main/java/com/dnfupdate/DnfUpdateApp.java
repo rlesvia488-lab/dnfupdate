@@ -54,8 +54,18 @@ public final class DnfUpdateApp {
     private static final int DEFAULT_PORT = 8080;
     private static final int MAX_EVENT_HISTORY = 2000;
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
+    private static final String STATUS_LOG_FILE = "status-checks.tsv";
     private static final String REPORT_DIR = "reports";
+    private static final long REBOOT_WAIT_MILLIS = 5 * 60 * 1000L;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
+    private static final List<String> HEALTHCHECK_URLS = List.of(
+            "http://127.0.0.1:8080/actuator/health",
+            "https://127.0.0.1:8443/actuator/health",
+            "https://127.0.0.1:8443/health",
+            "https://127.0.0.1:8443/mgw/health",
+            "https://127.0.0.1:8443/services/Version",
+            "https://127.0.0.1:8443/api/health-check/v1.0/health"
+    );
     private static final List<AuthPassphrase> AUTHORIZED_PASSPHRASES = List.of(
             new AuthPassphrase("member-01", "955d62e5e35a83af2a33e6d0b81bcd6a8fee326a9c353044a4763eb79b6c6828"),
             new AuthPassphrase("member-02", "4baea3706961d4f19c23486e254b097801247318759716d357f4c4291b9b08db"),
@@ -97,6 +107,7 @@ public final class DnfUpdateApp {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/patching", app::handlePatching);
         server.createContext("/dryrun", app::handleDryRunReports);
+        server.createContext("/status", app::handleStatus);
         server.createContext("/reports", app::handleReportFile);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
@@ -106,6 +117,7 @@ public final class DnfUpdateApp {
         System.out.println("DNF Update UI running at http://localhost:" + port);
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
         System.out.println("Patch audit log: " + appDir.resolve(AUDIT_LOG_FILE).toAbsolutePath());
+        System.out.println("Post-reboot status log: " + appDir.resolve(STATUS_LOG_FILE).toAbsolutePath());
         System.out.println("HTML reports directory: " + appDir.resolve(REPORT_DIR).toAbsolutePath());
     }
 
@@ -143,6 +155,14 @@ public final class DnfUpdateApp {
             return;
         }
         send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.DRY_RUN));
+    }
+
+    private void handleStatus(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "text/plain", "Method not allowed");
+            return;
+        }
+        send(exchange, 200, "text/html; charset=utf-8", buildStatusPage());
     }
 
     private void handleReportFile(HttpExchange exchange) throws IOException {
@@ -383,6 +403,24 @@ public final class DnfUpdateApp {
             if (job.settings.reboot) {
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
                 runRemote(job, host, session, "sudo -n systemctl reboot -i || sudo -n reboot", true);
+                session.disconnect();
+                session = null;
+                PostRebootStatus status = verifyAfterReboot(job, host, report);
+                try {
+                    appendStatusLog(job, host, status);
+                } catch (IOException e) {
+                    job.add(host, "warn", "Unable to write post-reboot status log: " + e.getMessage());
+                }
+                if (!status.machineUp()) {
+                    job.fail(host, "Update finished, but server was not reachable over SSH after reboot wait.");
+                    return;
+                }
+                if (!status.serviceUp()) {
+                    job.fail(host, "Update finished and server is reachable, but no configured health check returned HTTP 200.");
+                    return;
+                }
+                job.succeed(host, "Update finished, reboot verified, and service is up via " + status.workingHealthcheck().orElse("unknown health check") + ".");
+                return;
             }
             job.succeed(host, job.settings.reboot ? "Update command finished and reboot was requested." : "Update command finished.");
         } catch (Exception e) {
@@ -392,6 +430,55 @@ public final class DnfUpdateApp {
                 session.disconnect();
             }
         }
+    }
+
+    private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report) {
+        job.add(host, "info", "Waiting 5 minutes before post-reboot SSH verification.");
+        sleep(REBOOT_WAIT_MILLIS);
+
+        Session verificationSession = null;
+        try {
+            verificationSession = connect(job, host);
+            report.machineUpAfterReboot = true;
+            job.add(host, "success", "Server is reachable over SSH after reboot.");
+
+            for (String url : HEALTHCHECK_URLS) {
+                String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time 10 " + shellQuote(url);
+                RemoteResult result = runRemote(job, host, verificationSession, command, true);
+                String statusCode = result.lines().isEmpty() ? "" : result.lines().get(result.lines().size() - 1).trim();
+                if ("200".equals(statusCode)) {
+                    report.serviceUpAfterReboot = true;
+                    report.workingHealthcheck = url;
+                    job.add(host, "success", "Service health check returned HTTP 200: " + url);
+                    return new PostRebootStatus(true, true, Optional.of(url));
+                }
+            }
+
+            report.serviceUpAfterReboot = false;
+            job.add(host, "error", "Server is reachable, but none of the configured health checks returned HTTP 200.");
+            return new PostRebootStatus(true, false, Optional.empty());
+        } catch (Exception e) {
+            report.machineUpAfterReboot = false;
+            report.serviceUpAfterReboot = false;
+            job.add(host, "error", "Server is not reachable over SSH after reboot wait: " + cleanMessage(e));
+            return new PostRebootStatus(false, false, Optional.empty());
+        } finally {
+            if (verificationSession != null) {
+                verificationSession.disconnect();
+            }
+        }
+    }
+
+    private void appendStatusLog(Job job, String host, PostRebootStatus status) throws IOException {
+        String line = Instant.now()
+                + "\t" + job.id
+                + "\t" + host
+                + "\t" + (status.machineUp() ? "UP" : "DOWN")
+                + "\t" + (status.serviceUp() ? "UP" : "DOWN")
+                + "\t" + status.workingHealthcheck().orElse("")
+                + System.lineSeparator();
+        Files.writeString(appDir.resolve(STATUS_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
     }
 
     private Session connect(Job job, String host) throws JSchException, IOException {
@@ -566,6 +653,8 @@ public final class DnfUpdateApp {
         html.append("<table><thead><tr>");
         if (job.settings.dryRun) {
             html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
+        } else if (job.settings.reboot) {
+            html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th><th>Machine After Reboot</th><th>Service After Reboot</th><th>Working Healthcheck</th>");
         } else {
             html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th>");
         }
@@ -582,8 +671,13 @@ public final class DnfUpdateApp {
             if (!job.settings.dryRun) {
                 html.append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>");
             }
-            html.append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>")
-                    .append("</tr>");
+            html.append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>");
+            if (!job.settings.dryRun && job.settings.reboot) {
+                html.append(statusCell(report.machineUpAfterReboot == null ? "UNKNOWN" : report.machineUpAfterReboot ? "UP" : "DOWN"))
+                        .append(statusCell(report.serviceUpAfterReboot == null ? "UNKNOWN" : report.serviceUpAfterReboot ? "UP" : "DOWN"))
+                        .append("<td>").append(report.workingHealthcheck == null ? "<span class=\"empty\">None</span>" : escapeHtml(report.workingHealthcheck)).append("</td>");
+            }
+            html.append("</tr>");
         }
         html.append("</tbody></table>");
         html.append("""
@@ -681,6 +775,111 @@ public final class DnfUpdateApp {
         return html.toString();
     }
 
+    private String buildStatusPage() throws IOException {
+        List<StatusEntry> statuses = readStatusEntries();
+        statuses.sort(Comparator.comparing(StatusEntry::checkedAt).reversed());
+
+        StringBuilder html = new StringBuilder();
+        html.append("""
+                <!doctype html>
+                <html lang="en">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <title>Post-Reboot Status</title>
+                  <style>
+                    body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #f4f7fb; }
+                    main { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 24px 0; }
+                    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 18px; }
+                    h1 { margin: 0; font-size: 26px; }
+                    a { color: #1d4ed8; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                    .button { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; background: #fff; }
+                    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d8dee9; }
+                    th, td { border-bottom: 1px solid #d8dee9; padding: 11px; text-align: left; vertical-align: top; }
+                    th { background: #eef2f7; font-size: 13px; }
+                    .up { color: #15803d; font-weight: 700; }
+                    .down { color: #b91c1c; font-weight: 700; }
+                    .empty { background: #fff; border: 1px solid #d8dee9; border-radius: 8px; padding: 18px; color: #64748b; }
+                    .muted { color: #64748b; font-size: 13px; }
+                  </style>
+                </head>
+                <body>
+                <main>
+                  <header>
+                    <div>
+                      <h1>Post-Reboot Status</h1>
+                      <div class="muted">Newest checks first</div>
+                    </div>
+                    <a class="button" href="/">Update Console</a>
+                  </header>
+                """);
+        if (statuses.isEmpty()) {
+            html.append("<div class=\"empty\">No post-reboot status checks have been recorded yet.</div>");
+        } else {
+            html.append("<table><thead><tr>")
+                    .append("<th>Date</th><th>Server</th><th>Machine</th><th>Service</th><th>Working Healthcheck</th><th>Run ID</th>")
+                    .append("</tr></thead><tbody>");
+            for (StatusEntry status : statuses) {
+                html.append("<tr>")
+                        .append("<td>").append(escapeHtml(REPORT_DISPLAY_CLOCK.format(status.checkedAt()))).append("</td>")
+                        .append("<td>").append(escapeHtml(status.host())).append("</td>")
+                        .append(statusCell(status.machineStatus()))
+                        .append(statusCell(status.serviceStatus()))
+                        .append("<td>").append(status.workingHealthcheck().isBlank() ? "<span class=\"muted\">None</span>" : escapeHtml(status.workingHealthcheck())).append("</td>")
+                        .append("<td>").append(escapeHtml(status.jobId())).append("</td>")
+                        .append("</tr>");
+            }
+            html.append("</tbody></table>");
+        }
+        html.append("""
+                </main>
+                </body>
+                </html>
+                """);
+        return html.toString();
+    }
+
+    private List<StatusEntry> readStatusEntries() throws IOException {
+        Path statusLog = appDir.resolve(STATUS_LOG_FILE).normalize();
+        if (!Files.isRegularFile(statusLog)) {
+            return new ArrayList<>();
+        }
+        List<StatusEntry> entries = new ArrayList<>();
+        for (String line : Files.readAllLines(statusLog, StandardCharsets.UTF_8)) {
+            String[] parts = line.split("\t", -1);
+            if (parts.length < 6) {
+                continue;
+            }
+            try {
+                entries.add(new StatusEntry(
+                        Instant.parse(stripBom(parts[0])),
+                        parts[1],
+                        parts[2],
+                        parts[3],
+                        parts[4],
+                        parts[5]
+                ));
+            } catch (Exception ignored) {
+                // Skip malformed status lines.
+            }
+        }
+        return entries;
+    }
+
+    private static String stripBom(String value) {
+        if (value != null && !value.isEmpty() && value.charAt(0) == '\uFEFF') {
+            return value.substring(1);
+        }
+        return value;
+    }
+
+    private static String statusCell(String status) {
+        String normalized = status == null ? "DOWN" : status.toUpperCase(Locale.ROOT);
+        String css = "UP".equals(normalized) ? "up" : "down";
+        return "<td class=\"" + css + "\">" + escapeHtml(normalized) + "</td>";
+    }
+
     private static String formatBytes(long bytes) {
         if (bytes < 1024) {
             return bytes + " B";
@@ -767,6 +966,10 @@ public final class DnfUpdateApp {
 
     private static String cleanMessage(Exception e) {
         return Optional.ofNullable(e.getMessage()).orElse(e.getClass().getSimpleName()).replace("\"", "'");
+    }
+
+    private static String shellQuote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
     }
 
     private static String sha256Hex(String value) {
@@ -859,6 +1062,19 @@ public final class DnfUpdateApp {
     private record ReportEntry(String name, Instant modifiedAt, long size) {
     }
 
+    private record StatusEntry(
+            Instant checkedAt,
+            String jobId,
+            String host,
+            String machineStatus,
+            String serviceStatus,
+            String workingHealthcheck
+    ) {
+    }
+
+    private record PostRebootStatus(boolean machineUp, boolean serviceUp, Optional<String> workingHealthcheck) {
+    }
+
     private enum ReportKind {
         PATCH,
         DRY_RUN
@@ -868,6 +1084,9 @@ public final class DnfUpdateApp {
         private final Set<String> rhsaPresentBefore = Collections.synchronizedSet(new TreeSet<>());
         private final Set<String> rhsaInstalledAfter = Collections.synchronizedSet(new TreeSet<>());
         private final Set<String> rhsaCorrected = Collections.synchronizedSet(new TreeSet<>());
+        private volatile Boolean machineUpAfterReboot;
+        private volatile Boolean serviceUpAfterReboot;
+        private volatile String workingHealthcheck;
     }
 
     private static final class Job {
@@ -1158,7 +1377,7 @@ public final class DnfUpdateApp {
                         <h1>DNF Security Update Console</h1>
                         <div class="subtitle">Runs <code>dnf update --security</code> over SSH, streams progress, then reboots selected servers.</div>
                       </div>
-                      <div class="subtitle"><a href="/patching">Patch reports</a> · <a href="/dryrun">Dry run reports</a> · Keys are loaded from the JAR folder</div>
+                      <div class="subtitle"><a href="/patching">Patch reports</a> · <a href="/dryrun">Dry run reports</a> · <a href="/status">Status</a> · Keys are loaded from the JAR folder</div>
                     </div>
                   </header>
                   <main class="wrap">

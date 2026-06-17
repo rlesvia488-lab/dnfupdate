@@ -2,5 +2,7 @@ patch-passphrases.txt
 dist/patch-passphrases.txt
 patch-audit.log
 dist/patch-audit.log
+status-checks.tsv
+dist/status-checks.tsv
 reports/
 dist/reports/

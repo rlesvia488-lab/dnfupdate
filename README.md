@@ -36,6 +36,20 @@ The app has 14 built-in authorized patch passphrases. The UI requires one valid 
 
 Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
 
+When reboot is enabled, the app waits 5 minutes after sending the reboot command, reconnects over SSH, and then runs local curl health checks on the server. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
+
+Post-reboot machine and service status is stored in:
+
+```text
+status-checks.tsv
+```
+
+To browse post-reboot status checks from the app, open:
+
+```text
+http://localhost:8080/status
+```
+
 Each completed run also creates a timestamped HTML report beside the JAR:
 
 ```text
@@ -88,6 +102,7 @@ java -jar dnf-security-update-console.jar
 - Command: `sudo -n dnf -y update --security`
 - Reboot: enabled by default
 - Audit log: `patch-audit.log`
+- Post-reboot status log: `status-checks.tsv`
 - HTML reports: `reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html`
 - Dry run reports: `reports\dryrun-report-YYYYMMDD-HHMMSS-<run-id>.html`
 
@@ -106,6 +121,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Timestamped HTML report after each run
 - `/patching` report browser ordered by date
 - `/dryrun` dry run report browser ordered by date
+- `/status` post-reboot machine and service status ordered by date
 - Configurable SSH port, timeout, key filenames, and parallel server count
 
 # dnfupdate
