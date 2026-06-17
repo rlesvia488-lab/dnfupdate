@@ -21,6 +21,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -45,6 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class DnfUpdateApp {
     private static final int DEFAULT_PORT = 8080;
     private static final int MAX_EVENT_HISTORY = 2000;
+    private static final int PASSPHRASE_COUNT = 14;
+    private static final String PASSPHRASE_FILE = "patch-passphrases.txt";
+    private static final SecureRandom RANDOM = new SecureRandom();
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
 
@@ -63,6 +67,7 @@ public final class DnfUpdateApp {
 
         Path appDir = findAppDir();
         DnfUpdateApp app = new DnfUpdateApp(appDir);
+        Path passphraseFile = app.ensurePassphraseFile();
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
@@ -71,6 +76,7 @@ public final class DnfUpdateApp {
         server.start();
         System.out.println("DNF Update UI running at http://localhost:" + port);
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
+        System.out.println("Patch passphrases file: " + passphraseFile.toAbsolutePath());
     }
 
     private static Path findAppDir() {
@@ -100,6 +106,11 @@ public final class DnfUpdateApp {
         }
 
         Map<String, String> form = readForm(exchange);
+        if (!isAuthorizedPassphrase(form.get("passphrase"))) {
+            send(exchange, 403, "application/json", "{\"error\":\"Invalid patch passphrase.\"}");
+            return;
+        }
+
         List<String> hosts = form.getOrDefault("hosts", "").lines()
                 .map(String::trim)
                 .filter(line -> !line.isBlank())
@@ -135,6 +146,62 @@ public final class DnfUpdateApp {
         jobs.put(job.id, job);
         jobPool.submit(() -> runJob(job));
         send(exchange, 200, "application/json", "{\"jobId\":\"" + escapeJson(job.id) + "\"}");
+    }
+
+    private Path ensurePassphraseFile() throws IOException {
+        Path file = appDir.resolve(PASSPHRASE_FILE).normalize();
+        if (Files.isRegularFile(file)) {
+            return file;
+        }
+
+        List<String> lines = new ArrayList<>();
+        lines.add("# DNF Security Update Console patch passphrases");
+        lines.add("# Give one passphrase to each authorized member. One valid passphrase is required to start patching.");
+        lines.add("# Keep this file private. Delete it and restart the app to generate a new set.");
+        for (int i = 1; i <= PASSPHRASE_COUNT; i++) {
+            lines.add(String.format("%02d: %s", i, generatePassphrase()));
+        }
+        Files.write(file, lines, StandardCharsets.UTF_8);
+        return file;
+    }
+
+    private boolean isAuthorizedPassphrase(String submitted) throws IOException {
+        String normalized = submitted == null ? "" : submitted.trim();
+        if (normalized.isBlank()) {
+            return false;
+        }
+
+        Path file = ensurePassphraseFile();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            String candidate = line.trim();
+            if (candidate.isBlank() || candidate.startsWith("#")) {
+                continue;
+            }
+            int labelSeparator = candidate.indexOf(':');
+            if (labelSeparator >= 0) {
+                candidate = candidate.substring(labelSeparator + 1).trim();
+            }
+            if (constantTimeEquals(normalized, candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String generatePassphrase() {
+        String[] words = {
+                "anchor", "atlas", "brisk", "canyon", "cedar", "comet", "copper", "delta",
+                "ember", "falcon", "frost", "harbor", "hazel", "indigo", "jasmine", "keystone",
+                "lantern", "maple", "matrix", "meadow", "meteor", "nebula", "onyx", "orchid",
+                "polar", "quartz", "raven", "river", "saffron", "signal", "silver", "summit",
+                "timber", "tundra", "velvet", "vertex", "violet", "wander", "willow", "zenith"
+        };
+        return pick(words) + "-" + pick(words) + "-" + pick(words) + "-" + pick(words)
+                + "-" + (1000 + RANDOM.nextInt(9000));
+    }
+
+    private static String pick(String[] words) {
+        return words[RANDOM.nextInt(words.length)];
     }
 
     private void handleJob(HttpExchange exchange) throws IOException {
@@ -394,6 +461,19 @@ public final class DnfUpdateApp {
 
     private static String cleanMessage(Exception e) {
         return Optional.ofNullable(e.getMessage()).orElse(e.getClass().getSimpleName()).replace("\"", "'");
+    }
+
+    private static boolean constantTimeEquals(String left, String right) {
+        byte[] leftBytes = left.getBytes(StandardCharsets.UTF_8);
+        byte[] rightBytes = right.getBytes(StandardCharsets.UTF_8);
+        int diff = leftBytes.length ^ rightBytes.length;
+        int max = Math.max(leftBytes.length, rightBytes.length);
+        for (int i = 0; i < max; i++) {
+            byte a = i < leftBytes.length ? leftBytes[i] : 0;
+            byte b = i < rightBytes.length ? rightBytes[i] : 0;
+            diff |= a ^ b;
+        }
+        return diff == 0;
     }
 
     private static String escapeJson(String value) {
@@ -718,6 +798,11 @@ public final class DnfUpdateApp {
                   <main class="wrap">
                     <section class="controls">
                       <form id="jobForm">
+                        <div class="field">
+                          <label for="passphrase">Patch passphrase</label>
+                          <input id="passphrase" name="passphrase" type="password" autocomplete="off" required>
+                          <div class="muted">Required before any server patching starts.</div>
+                        </div>
                         <div class="field">
                           <label for="hosts">Servers</label>
                           <textarea id="hosts" name="hosts" placeholder="10.0.1.10&#10;10.0.1.11"></textarea>
