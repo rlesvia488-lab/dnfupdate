@@ -54,3 +54,5 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Optional DNF cache refresh
 - Optional `--skip-broken`
 - Configurable SSH port, timeout, key filenames, and parallel server count
+
+# dnfupdate
