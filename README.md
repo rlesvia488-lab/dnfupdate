@@ -4,6 +4,8 @@ A single runnable JAR that serves a browser UI and runs `dnf update --security` 
 
 ## Build
 
+Requires JDK 17 or newer to build. The build script emits Java 17-compatible bytecode.
+
 ```powershell
 .\build.ps1
 ```
@@ -15,6 +17,8 @@ dist\dnf-security-update-console.jar
 ```
 
 ## Run
+
+Requires Java 17 or newer.
 
 Put the two PPK files next to the JAR, then run:
 

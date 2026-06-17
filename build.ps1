@@ -26,7 +26,7 @@ Get-ChildItem -Path (Join-Path $root "src\main\java") -Recurse -Filter *.java |
     Set-Content -Encoding ascii $sourceList
 $oldErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$javacOutput = & javac "-J-Dsun.zip.disableMemoryMapping=true" -encoding UTF-8 -cp "$dep" -d "$classes" "@$sourceList" 2>&1
+$javacOutput = & javac "-J-Dsun.zip.disableMemoryMapping=true" --release 17 -encoding UTF-8 -cp "$dep" -d "$classes" "@$sourceList" 2>&1
 $javacExit = $LASTEXITCODE
 $ErrorActionPreference = $oldErrorActionPreference
 if ($javacExit -ne 0) {

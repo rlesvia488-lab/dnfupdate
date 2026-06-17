@@ -67,7 +67,7 @@ public final class DnfUpdateApp {
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
         server.createContext("/api/job", app::handleJob);
-        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.setExecutor(Executors.newCachedThreadPool());
         server.start();
         System.out.println("DNF Update UI running at http://localhost:" + port);
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
