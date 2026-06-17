@@ -17,6 +17,7 @@ import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -28,6 +29,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -93,6 +95,8 @@ public final class DnfUpdateApp {
         Path appDir = findAppDir();
         DnfUpdateApp app = new DnfUpdateApp(appDir);
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/patching", app::handlePatching);
+        server.createContext("/reports", app::handleReportFile);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
         server.createContext("/api/job", app::handleJob);
@@ -122,6 +126,48 @@ public final class DnfUpdateApp {
             return;
         }
         send(exchange, 200, "text/html; charset=utf-8", Html.INDEX);
+    }
+
+    private void handlePatching(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "text/plain", "Method not allowed");
+            return;
+        }
+        send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex());
+    }
+
+    private void handleReportFile(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "text/plain", "Method not allowed");
+            return;
+        }
+
+        String prefix = "/reports/";
+        String path = exchange.getRequestURI().getPath();
+        if (!path.startsWith(prefix) || path.length() <= prefix.length()) {
+            send(exchange, 404, "text/plain", "Report not found");
+            return;
+        }
+
+        String requestedName = URLDecoder.decode(path.substring(prefix.length()), StandardCharsets.UTF_8);
+        if (requestedName.contains("/") || requestedName.contains("\\") || !requestedName.endsWith(".html")) {
+            send(exchange, 400, "text/plain", "Invalid report name");
+            return;
+        }
+
+        Path reportsDir = appDir.resolve(REPORT_DIR).normalize();
+        Path report = reportsDir.resolve(requestedName).normalize();
+        if (!report.startsWith(reportsDir) || !Files.isRegularFile(report)) {
+            send(exchange, 404, "text/plain", "Report not found");
+            return;
+        }
+
+        byte[] data = Files.readAllBytes(report);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(200, data.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(data);
+        }
     }
 
     private void handleStart(HttpExchange exchange) throws IOException {
@@ -523,6 +569,94 @@ public final class DnfUpdateApp {
         return html.toString();
     }
 
+    private String buildReportsIndex() throws IOException {
+        Path reportsDir = appDir.resolve(REPORT_DIR).normalize();
+        Files.createDirectories(reportsDir);
+        List<ReportEntry> reports = new ArrayList<>();
+        try (var stream = Files.list(reportsDir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".html"))
+                    .forEach(path -> {
+                        try {
+                            reports.add(new ReportEntry(
+                                    path.getFileName().toString(),
+                                    Files.getLastModifiedTime(path).toInstant(),
+                                    Files.size(path)
+                            ));
+                        } catch (IOException ignored) {
+                            // Skip unreadable report files.
+                        }
+                    });
+        }
+        reports.sort(Comparator.comparing(ReportEntry::modifiedAt).reversed()
+                .thenComparing(ReportEntry::name));
+
+        StringBuilder html = new StringBuilder();
+        html.append("""
+                <!doctype html>
+                <html lang="en">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <title>Patch Reports</title>
+                  <style>
+                    body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #f4f7fb; }
+                    main { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 24px 0; }
+                    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 18px; }
+                    h1 { margin: 0; font-size: 26px; }
+                    a { color: #1d4ed8; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                    .button { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; background: #fff; }
+                    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d8dee9; }
+                    th, td { border-bottom: 1px solid #d8dee9; padding: 11px; text-align: left; }
+                    th { background: #eef2f7; font-size: 13px; }
+                    .empty { background: #fff; border: 1px solid #d8dee9; border-radius: 8px; padding: 18px; color: #64748b; }
+                    .muted { color: #64748b; font-size: 13px; }
+                  </style>
+                </head>
+                <body>
+                <main>
+                  <header>
+                    <div>
+                      <h1>Patch Reports</h1>
+                      <div class="muted">Newest reports first</div>
+                    </div>
+                    <a class="button" href="/">Update Console</a>
+                  </header>
+                """);
+        if (reports.isEmpty()) {
+            html.append("<div class=\"empty\">No patch reports have been generated yet.</div>");
+        } else {
+            html.append("<table><thead><tr><th>Report</th><th>Date</th><th>Size</th></tr></thead><tbody>");
+            for (ReportEntry report : reports) {
+                String href = "/reports/" + URLEncoder.encode(report.name(), StandardCharsets.UTF_8).replace("+", "%20");
+                html.append("<tr>")
+                        .append("<td><a href=\"").append(escapeHtml(href)).append("\">")
+                        .append(escapeHtml(report.name())).append("</a></td>")
+                        .append("<td>").append(escapeHtml(REPORT_DISPLAY_CLOCK.format(report.modifiedAt()))).append("</td>")
+                        .append("<td>").append(escapeHtml(formatBytes(report.size()))).append("</td>")
+                        .append("</tr>");
+            }
+            html.append("</tbody></table>");
+        }
+        html.append("""
+                </main>
+                </body>
+                </html>
+                """);
+        return html.toString();
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        if (bytes < 1024 * 1024) {
+            return String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0);
+        }
+        return String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
     private static String stat(String label, int value) {
         return stat(label, Integer.toString(value));
     }
@@ -685,6 +819,9 @@ public final class DnfUpdateApp {
     }
 
     private record RemoteResult(int exitStatus, List<String> lines) {
+    }
+
+    private record ReportEntry(String name, Instant modifiedAt, long size) {
     }
 
     private static final class HostReport {
@@ -981,7 +1118,7 @@ public final class DnfUpdateApp {
                         <h1>DNF Security Update Console</h1>
                         <div class="subtitle">Runs <code>dnf update --security</code> over SSH, streams progress, then reboots selected servers.</div>
                       </div>
-                      <div class="subtitle">Keys are loaded from the JAR folder</div>
+                      <div class="subtitle"><a href="/patching">Patch reports</a> · Keys are loaded from the JAR folder</div>
                     </div>
                   </header>
                   <main class="wrap">

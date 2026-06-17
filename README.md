@@ -44,6 +44,14 @@ reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html
 
 The report includes each server's patching status, RHSA advisories present before patching, RHSA advisories confirmed as installed/corrected after patching, and the full installed security RHSA set observed after the update.
 
+To browse reports from the app, open:
+
+```text
+http://localhost:8080/patching
+```
+
+Reports are listed newest first and can be opened directly from that page.
+
 To use another port:
 
 ```powershell
@@ -73,6 +81,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Optional `--skip-broken`
 - Required patch passphrase
 - Timestamped HTML report after each run
+- `/patching` report browser ordered by date
 - Configurable SSH port, timeout, key filenames, and parallel server count
 
 # dnfupdate
