@@ -3,9 +3,9 @@
 # Give one passphrase to each authorized member.
 # These passphrases correspond to the hashed values embedded in the JAR.
 
-member-01: cedar-orchid-summit-quartz-4827
-member-02: nebula-harbor-velvet-copper-9135
-member-03: falcon-indigo-maple-signal-2604
+azi member-01: cedar-orchid-summit-quartz-4827
+ezz member-02: nebula-harbor-velvet-copper-9135
+fara member-03: falcon-indigo-maple-signal-2604
 member-04: river-lantern-onyx-tundra-7351
 member-05: jasmine-meteor-anchor-violet-6048
 member-06: polar-canyon-saffron-matrix-1579
