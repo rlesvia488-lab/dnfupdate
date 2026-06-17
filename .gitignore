@@ -2,3 +2,5 @@ patch-passphrases.txt
 dist/patch-passphrases.txt
 patch-audit.log
 dist/patch-audit.log
+reports/
+dist/reports/

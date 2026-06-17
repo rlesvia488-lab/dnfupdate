@@ -36,6 +36,14 @@ The app has 14 built-in authorized patch passphrases. The UI requires one valid 
 
 Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
 
+Each completed run also creates a timestamped HTML report beside the JAR:
+
+```text
+reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html
+```
+
+The report includes each server's patching status, RHSA advisories present before patching, RHSA advisories confirmed as installed/corrected after patching, and the full installed security RHSA set observed after the update.
+
 To use another port:
 
 ```powershell
@@ -51,6 +59,7 @@ java -jar dnf-security-update-console.jar
 - Command: `sudo -n dnf -y update --security`
 - Reboot: enabled by default
 - Audit log: `patch-audit.log`
+- HTML reports: `reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html`
 
 The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
 
@@ -63,6 +72,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - Optional DNF cache refresh
 - Optional `--skip-broken`
 - Required patch passphrase
+- Timestamped HTML report after each run
 - Configurable SSH port, timeout, key filenames, and parallel server count
 
 # dnfupdate

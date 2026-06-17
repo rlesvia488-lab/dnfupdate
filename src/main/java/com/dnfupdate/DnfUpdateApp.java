@@ -34,6 +34,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,11 +45,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class DnfUpdateApp {
     private static final int DEFAULT_PORT = 8080;
     private static final int MAX_EVENT_HISTORY = 2000;
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
+    private static final String REPORT_DIR = "reports";
+    private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
     private static final List<AuthPassphrase> AUTHORIZED_PASSPHRASES = List.of(
             new AuthPassphrase("member-01", "955d62e5e35a83af2a33e6d0b81bcd6a8fee326a9c353044a4763eb79b6c6828"),
             new AuthPassphrase("member-02", "4baea3706961d4f19c23486e254b097801247318759716d357f4c4291b9b08db"),
@@ -66,6 +72,10 @@ public final class DnfUpdateApp {
     );
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
+    private static final DateTimeFormatter REPORT_FILE_CLOCK =
+            DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneId.systemDefault());
+    private static final DateTimeFormatter REPORT_DISPLAY_CLOCK =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(ZoneId.systemDefault());
 
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
@@ -91,6 +101,7 @@ public final class DnfUpdateApp {
         System.out.println("DNF Update UI running at http://localhost:" + port);
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
         System.out.println("Patch audit log: " + appDir.resolve(AUDIT_LOG_FILE).toAbsolutePath());
+        System.out.println("HTML reports directory: " + appDir.resolve(REPORT_DIR).toAbsolutePath());
     }
 
     private static Path findAppDir() {
@@ -263,6 +274,12 @@ public final class DnfUpdateApp {
         }
 
         CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+        try {
+            Path report = writeHtmlReport(job);
+            job.add("system", "success", "HTML report generated: " + report.toAbsolutePath());
+        } catch (IOException e) {
+            job.add("system", "error", "Unable to generate HTML report: " + e.getMessage());
+        }
         job.finished.set(true);
         job.add("system", job.failed.get() == 0 ? "success" : "error",
                 "Finished. Success: " + job.succeeded.get() + ", failed: " + job.failed.get() + ".");
@@ -271,17 +288,34 @@ public final class DnfUpdateApp {
     private void updateOneHost(Job job, String host) {
         job.startHost(host);
         Session session = null;
+        HostReport report = job.reportFor(host);
         try {
             session = connect(job, host);
             runRemote(job, host, session, "hostnamectl || hostname");
             if (job.settings.makecache) {
                 runRemote(job, host, session, "sudo -n dnf -y makecache --refresh");
             }
+            RemoteResult beforeSecurity = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --updates", true);
+            report.rhsaPresentBefore.addAll(extractRhsa(beforeSecurity.lines()));
+            if (report.rhsaPresentBefore.isEmpty()) {
+                job.add(host, "info", "No RHSA security advisories were listed before patching.");
+            } else {
+                job.add(host, "info", "RHSA present before patching: " + String.join(", ", report.rhsaPresentBefore));
+            }
             String updateCommand = "sudo -n dnf -y update --security";
             if (job.settings.skipBroken) {
                 updateCommand += " --skip-broken";
             }
             runRemote(job, host, session, updateCommand);
+            RemoteResult afterInstalled = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --installed", true);
+            report.rhsaInstalledAfter.addAll(extractRhsa(afterInstalled.lines()));
+            report.rhsaCorrected.addAll(report.rhsaPresentBefore);
+            report.rhsaCorrected.retainAll(report.rhsaInstalledAfter);
+            if (report.rhsaCorrected.isEmpty() && !report.rhsaPresentBefore.isEmpty()) {
+                job.add(host, "warn", "No matching corrected RHSA IDs were confirmed in installed updateinfo after patching.");
+            } else if (!report.rhsaCorrected.isEmpty()) {
+                job.add(host, "success", "RHSA corrected/installed: " + String.join(", ", report.rhsaCorrected));
+            }
             runRemote(job, host, session, "if command -v needs-restarting >/dev/null 2>&1; then sudo -n needs-restarting -r; else echo 'needs-restarting not installed; continuing'; fi", true);
             runRemote(job, host, session, "sync");
             if (job.settings.reboot) {
@@ -331,11 +365,11 @@ public final class DnfUpdateApp {
         throw last == null ? new JSchException("SSH authentication failed.") : last;
     }
 
-    private void runRemote(Job job, String host, Session session, String command) throws Exception {
-        runRemote(job, host, session, command, false);
+    private RemoteResult runRemote(Job job, String host, Session session, String command) throws Exception {
+        return runRemote(job, host, session, command, false);
     }
 
-    private void runRemote(Job job, String host, Session session, String command, boolean allowNonZero) throws Exception {
+    private RemoteResult runRemote(Job job, String host, Session session, String command, boolean allowNonZero) throws Exception {
         job.add(host, "cmd", "$ " + command);
         ChannelExec channel = (ChannelExec) session.openChannel("exec");
         channel.setCommand(command);
@@ -345,7 +379,7 @@ public final class DnfUpdateApp {
 
         try (InputStream output = channel.getInputStream()) {
             channel.connect();
-            readChannel(job, host, output, channel);
+            List<String> lines = readChannel(job, host, output, channel);
             String errorText = err.toString(StandardCharsets.UTF_8);
             if (!errorText.isBlank()) {
                 errorText.lines().forEach(line -> job.add(host, "warn", line));
@@ -357,14 +391,16 @@ public final class DnfUpdateApp {
             if (status != 0) {
                 job.add(host, "warn", "Command exited with " + status + " but was allowed to continue.");
             }
+            return new RemoteResult(status, lines);
         } finally {
             channel.disconnect();
         }
     }
 
-    private void readChannel(Job job, String host, InputStream input, ChannelExec channel) throws IOException {
+    private List<String> readChannel(Job job, String host, InputStream input, ChannelExec channel) throws IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         StringBuilder pending = new StringBuilder();
+        List<String> lines = new ArrayList<>();
         while (!channel.isClosed() || reader.ready()) {
             while (reader.ready()) {
                 int ch = reader.read();
@@ -372,21 +408,141 @@ public final class DnfUpdateApp {
                     break;
                 }
                 if (ch == '\n') {
-                    emitLine(job, host, pending);
+                    emitLine(job, host, pending, lines);
                 } else if (ch != '\r') {
                     pending.append((char) ch);
                 }
             }
             sleep(100);
         }
-        emitLine(job, host, pending);
+        emitLine(job, host, pending, lines);
+        return lines;
     }
 
-    private void emitLine(Job job, String host, StringBuilder pending) {
+    private void emitLine(Job job, String host, StringBuilder pending, List<String> lines) {
         if (!pending.isEmpty()) {
-            job.add(host, "out", pending.toString());
+            String line = pending.toString();
+            lines.add(line);
+            job.add(host, "out", line);
             pending.setLength(0);
         }
+    }
+
+    private static Set<String> extractRhsa(List<String> lines) {
+        Set<String> advisories = new TreeSet<>();
+        for (String line : lines) {
+            Matcher matcher = RHSA_PATTERN.matcher(line);
+            while (matcher.find()) {
+                advisories.add(matcher.group());
+            }
+        }
+        return advisories;
+    }
+
+    private Path writeHtmlReport(Job job) throws IOException {
+        Path reportsDir = appDir.resolve(REPORT_DIR).normalize();
+        Files.createDirectories(reportsDir);
+        Path reportPath = reportsDir.resolve("patch-report-" + REPORT_FILE_CLOCK.format(job.startedAt)
+                + "-" + job.id.substring(0, 8) + ".html");
+        Files.writeString(reportPath, buildHtmlReport(job), StandardCharsets.UTF_8);
+        return reportPath;
+    }
+
+    private String buildHtmlReport(Job job) {
+        StringBuilder html = new StringBuilder();
+        html.append("""
+                <!doctype html>
+                <html lang="en">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <title>DNF Patch Report</title>
+                  <style>
+                    body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #f4f7fb; }
+                    main { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 24px 0; }
+                    h1 { margin: 0 0 4px; font-size: 26px; }
+                    h2 { margin: 28px 0 10px; font-size: 18px; }
+                    .meta, .summary { background: #fff; border: 1px solid #d8dee9; border-radius: 8px; padding: 14px; margin-top: 14px; }
+                    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+                    .stat { border: 1px solid #d8dee9; border-radius: 8px; padding: 10px; background: #fff; }
+                    .stat b { display: block; font-size: 22px; }
+                    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d8dee9; }
+                    th, td { border-bottom: 1px solid #d8dee9; padding: 10px; text-align: left; vertical-align: top; }
+                    th { background: #eef2f7; font-size: 13px; }
+                    ul { margin: 0; padding-left: 18px; }
+                    .success { color: #15803d; font-weight: 700; }
+                    .failed { color: #b91c1c; font-weight: 700; }
+                    .running, .queued { color: #1d4ed8; font-weight: 700; }
+                    .empty { color: #64748b; }
+                    @media (max-width: 760px) { .grid { grid-template-columns: repeat(2, 1fr); } table { font-size: 13px; } }
+                  </style>
+                </head>
+                <body>
+                <main>
+                """);
+        html.append("<h1>DNF Patch Report</h1>");
+        html.append("<div class=\"meta\">")
+                .append("<div><b>Run ID:</b> ").append(escapeHtml(job.id)).append("</div>")
+                .append("<div><b>Started:</b> ").append(escapeHtml(REPORT_DISPLAY_CLOCK.format(job.startedAt))).append("</div>")
+                .append("<div><b>Authorized member:</b> ").append(escapeHtml(job.authorizedMember)).append("</div>")
+                .append("<div><b>Command:</b> sudo -n dnf -y update --security")
+                .append(job.settings.skipBroken ? " --skip-broken" : "")
+                .append("</div>")
+                .append("</div>");
+
+        html.append("<div class=\"summary grid\">")
+                .append(stat("Total", job.hosts.size()))
+                .append(stat("Succeeded", job.succeeded.get()))
+                .append(stat("Failed", job.failed.get()))
+                .append(stat("Reboot Requested", job.settings.reboot ? "Yes" : "No"))
+                .append("</div>");
+
+        html.append("<h2>Server Status And RHSA</h2>");
+        html.append("<table><thead><tr>")
+                .append("<th>Server</th><th>Status</th><th>RHSA Present Before</th><th>RHSA Corrected / Installed</th><th>Installed Security RHSA After</th>")
+                .append("</tr></thead><tbody>");
+        List<String> sortedHosts = new ArrayList<>(job.hosts);
+        Collections.sort(sortedHosts);
+        for (String host : sortedHosts) {
+            HostReport report = job.reportFor(host);
+            String status = job.hostStatus.getOrDefault(host, "unknown");
+            html.append("<tr>")
+                    .append("<td>").append(escapeHtml(host)).append("</td>")
+                    .append("<td class=\"").append(escapeHtml(status)).append("\">").append(escapeHtml(status)).append("</td>")
+                    .append("<td>").append(advisoryList(report.rhsaPresentBefore)).append("</td>")
+                    .append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>")
+                    .append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>")
+                    .append("</tr>");
+        }
+        html.append("</tbody></table>");
+        html.append("""
+                </main>
+                </body>
+                </html>
+                """);
+        return html.toString();
+    }
+
+    private static String stat(String label, int value) {
+        return stat(label, Integer.toString(value));
+    }
+
+    private static String stat(String label, String value) {
+        return "<div class=\"stat\"><b>" + escapeHtml(value) + "</b><span>" + escapeHtml(label) + "</span></div>";
+    }
+
+    private static String advisoryList(Set<String> advisories) {
+        if (advisories.isEmpty()) {
+            return "<span class=\"empty\">None recorded</span>";
+        }
+        StringBuilder html = new StringBuilder("<ul>");
+        synchronized (advisories) {
+            for (String advisory : advisories) {
+                html.append("<li>").append(escapeHtml(advisory)).append("</li>");
+            }
+        }
+        html.append("</ul>");
+        return html.toString();
     }
 
     private static Map<String, String> readForm(HttpExchange exchange) throws IOException {
@@ -496,6 +652,22 @@ public final class DnfUpdateApp {
         return builder.toString();
     }
 
+    private static String escapeHtml(String value) {
+        StringBuilder builder = new StringBuilder(value.length() + 16);
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '&' -> builder.append("&amp;");
+                case '<' -> builder.append("&lt;");
+                case '>' -> builder.append("&gt;");
+                case '"' -> builder.append("&quot;");
+                case '\'' -> builder.append("&#39;");
+                default -> builder.append(ch);
+            }
+        }
+        return builder.toString();
+    }
+
     private record Settings(
             String username,
             Path key1,
@@ -512,13 +684,24 @@ public final class DnfUpdateApp {
     private record AuthPassphrase(String memberId, String sha256Hex) {
     }
 
+    private record RemoteResult(int exitStatus, List<String> lines) {
+    }
+
+    private static final class HostReport {
+        private final Set<String> rhsaPresentBefore = Collections.synchronizedSet(new TreeSet<>());
+        private final Set<String> rhsaInstalledAfter = Collections.synchronizedSet(new TreeSet<>());
+        private final Set<String> rhsaCorrected = Collections.synchronizedSet(new TreeSet<>());
+    }
+
     private static final class Job {
         private final String id;
+        private final Instant startedAt = Instant.now();
         private final List<String> hosts;
         private final Settings settings;
         private final String authorizedMember;
         private final ConcurrentLinkedDeque<Event> events = new ConcurrentLinkedDeque<>();
         private final Map<String, String> hostStatus = new ConcurrentHashMap<>();
+        private final Map<String, HostReport> reports = new ConcurrentHashMap<>();
         private final AtomicBoolean finished = new AtomicBoolean(false);
         private final AtomicInteger succeeded = new AtomicInteger(0);
         private final AtomicInteger failed = new AtomicInteger(0);
@@ -529,6 +712,11 @@ public final class DnfUpdateApp {
             this.settings = settings;
             this.authorizedMember = authorizedMember;
             hosts.forEach(host -> hostStatus.put(host, "queued"));
+            hosts.forEach(host -> reports.put(host, new HostReport()));
+        }
+
+        private HostReport reportFor(String host) {
+            return reports.computeIfAbsent(host, ignored -> new HostReport());
         }
 
         private void startHost(String host) {
