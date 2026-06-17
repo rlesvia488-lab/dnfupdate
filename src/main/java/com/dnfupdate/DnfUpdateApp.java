@@ -138,6 +138,19 @@ public final class DnfUpdateApp {
             send(exchange, 405, "text/plain", "Method not allowed");
             return;
         }
+        String path = exchange.getRequestURI().getPath();
+        if ("/status".equals(path) || "/status/".equals(path)) {
+            send(exchange, 200, "text/html; charset=utf-8", buildStatusPage());
+            return;
+        }
+        if ("/patching".equals(path) || "/patching/".equals(path)) {
+            send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.PATCH));
+            return;
+        }
+        if ("/dryrun".equals(path) || "/dryrun/".equals(path)) {
+            send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.DRY_RUN));
+            return;
+        }
         send(exchange, 200, "text/html; charset=utf-8", Html.INDEX);
     }
 
@@ -402,7 +415,8 @@ public final class DnfUpdateApp {
             runRemote(job, host, session, "sync");
             if (job.settings.reboot) {
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
-                runRemote(job, host, session, "sudo -n systemctl reboot -i || sudo -n reboot", true);
+                job.add(host, "info", "After the reboot command is sent, the app will wait 5 minutes before reconnecting.");
+                runRemote(job, host, session, "sudo -n sh -c 'nohup sh -c \"sleep 2; systemctl reboot -i || reboot\" >/dev/null 2>&1 &'", true);
                 session.disconnect();
                 session = null;
                 PostRebootStatus status = verifyAfterReboot(job, host, report);
