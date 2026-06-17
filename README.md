@@ -32,13 +32,9 @@ Open:
 http://localhost:8080
 ```
 
-On first startup, the app creates 14 patch passphrases next to the JAR:
+The app has 14 built-in authorized patch passphrases. The UI requires one valid passphrase before it will start any patching job.
 
-```text
-patch-passphrases.txt
-```
-
-Give one passphrase to each authorized member. The UI requires a valid passphrase before it will start any patching job. Keep this file private; delete it and restart the app to generate a new set.
+Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
 
 To use another port:
 
@@ -54,7 +50,7 @@ java -jar dnf-security-update-console.jar
 - Fallback key: `key2.ppk`
 - Command: `sudo -n dnf -y update --security`
 - Reboot: enabled by default
-- Passphrase file: `patch-passphrases.txt`
+- Audit log: `patch-audit.log`
 
 The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
 

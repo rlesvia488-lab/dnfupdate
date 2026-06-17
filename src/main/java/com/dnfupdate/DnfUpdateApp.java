@@ -21,7 +21,8 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.SecureRandom;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -46,9 +47,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class DnfUpdateApp {
     private static final int DEFAULT_PORT = 8080;
     private static final int MAX_EVENT_HISTORY = 2000;
-    private static final int PASSPHRASE_COUNT = 14;
-    private static final String PASSPHRASE_FILE = "patch-passphrases.txt";
-    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final String AUDIT_LOG_FILE = "patch-audit.log";
+    private static final List<AuthPassphrase> AUTHORIZED_PASSPHRASES = List.of(
+            new AuthPassphrase("member-01", "955d62e5e35a83af2a33e6d0b81bcd6a8fee326a9c353044a4763eb79b6c6828"),
+            new AuthPassphrase("member-02", "4baea3706961d4f19c23486e254b097801247318759716d357f4c4291b9b08db"),
+            new AuthPassphrase("member-03", "2bbc56ba0c56a5b3f467efb9fc5d39c3f4b9e69927def3f77131ded825240425"),
+            new AuthPassphrase("member-04", "0bf620d498213ed4d36edcf4268a012d89717d0069badb493f44025245bc07fa"),
+            new AuthPassphrase("member-05", "729f821b4cd92998f74607d710ef9fc65cd9438b17191d2b61a72ad3b4f4f917"),
+            new AuthPassphrase("member-06", "9715a70fa988651ec048d063b97f0bdd7268f9127b93773dc44ed66015f19fbb"),
+            new AuthPassphrase("member-07", "a11d4e261748573bfc29ac00e69fc22e66c32c12ddd69fd7c2116b5283ac969d"),
+            new AuthPassphrase("member-08", "b18f68e4553f71894dfd81ccdcadac3ff893e8c6387bfdc364b6ca48c60ff489"),
+            new AuthPassphrase("member-09", "639646ccc08a8bce3e09f00e0d9a489e2bd72a4b430724dd705d878970c3e579"),
+            new AuthPassphrase("member-10", "f3d0938da118f9be94bcf46ce4abd42d4f4af968455b68364b99e7161331d643"),
+            new AuthPassphrase("member-11", "204dacab88e78a161f6519e98089a3006281100b6dfe51ddce885ce59e3b1f0a"),
+            new AuthPassphrase("member-12", "590e633ffec79c6d4b04c881c690d39ccb8eafb011ef473a847a9176ca214cdb"),
+            new AuthPassphrase("member-13", "a02593564740608962aadad6b31da0351b3e74efb3af12e580150734262ba687"),
+            new AuthPassphrase("member-14", "bbcf55582e9df7f189aa9c9ea5b46a6b005c6e54d81fed8c9045e030a80862c3")
+    );
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
 
@@ -67,7 +82,6 @@ public final class DnfUpdateApp {
 
         Path appDir = findAppDir();
         DnfUpdateApp app = new DnfUpdateApp(appDir);
-        Path passphraseFile = app.ensurePassphraseFile();
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
@@ -76,7 +90,7 @@ public final class DnfUpdateApp {
         server.start();
         System.out.println("DNF Update UI running at http://localhost:" + port);
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
-        System.out.println("Patch passphrases file: " + passphraseFile.toAbsolutePath());
+        System.out.println("Patch audit log: " + appDir.resolve(AUDIT_LOG_FILE).toAbsolutePath());
     }
 
     private static Path findAppDir() {
@@ -106,7 +120,8 @@ public final class DnfUpdateApp {
         }
 
         Map<String, String> form = readForm(exchange);
-        if (!isAuthorizedPassphrase(form.get("passphrase"))) {
+        Optional<String> authorizedMember = authorizedMember(form.get("passphrase"));
+        if (authorizedMember.isEmpty()) {
             send(exchange, 403, "application/json", "{\"error\":\"Invalid patch passphrase.\"}");
             return;
         }
@@ -142,66 +157,32 @@ public final class DnfUpdateApp {
                 "on".equals(form.get("skipBroken"))
         );
 
-        Job job = new Job(UUID.randomUUID().toString(), hosts, settings);
+        Job job = new Job(UUID.randomUUID().toString(), hosts, settings, authorizedMember.get());
+        appendAuditLog(authorizedMember.get(), hosts);
         jobs.put(job.id, job);
         jobPool.submit(() -> runJob(job));
         send(exchange, 200, "application/json", "{\"jobId\":\"" + escapeJson(job.id) + "\"}");
     }
 
-    private Path ensurePassphraseFile() throws IOException {
-        Path file = appDir.resolve(PASSPHRASE_FILE).normalize();
-        if (Files.isRegularFile(file)) {
-            return file;
-        }
-
-        List<String> lines = new ArrayList<>();
-        lines.add("# DNF Security Update Console patch passphrases");
-        lines.add("# Give one passphrase to each authorized member. One valid passphrase is required to start patching.");
-        lines.add("# Keep this file private. Delete it and restart the app to generate a new set.");
-        for (int i = 1; i <= PASSPHRASE_COUNT; i++) {
-            lines.add(String.format("%02d: %s", i, generatePassphrase()));
-        }
-        Files.write(file, lines, StandardCharsets.UTF_8);
-        return file;
-    }
-
-    private boolean isAuthorizedPassphrase(String submitted) throws IOException {
+    private Optional<String> authorizedMember(String submitted) {
         String normalized = submitted == null ? "" : submitted.trim();
         if (normalized.isBlank()) {
-            return false;
+            return Optional.empty();
         }
 
-        Path file = ensurePassphraseFile();
-        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
-            String candidate = line.trim();
-            if (candidate.isBlank() || candidate.startsWith("#")) {
-                continue;
-            }
-            int labelSeparator = candidate.indexOf(':');
-            if (labelSeparator >= 0) {
-                candidate = candidate.substring(labelSeparator + 1).trim();
-            }
-            if (constantTimeEquals(normalized, candidate)) {
-                return true;
+        String submittedHash = sha256Hex(normalized);
+        for (AuthPassphrase passphrase : AUTHORIZED_PASSPHRASES) {
+            if (constantTimeEquals(submittedHash, passphrase.sha256Hex())) {
+                return Optional.of(passphrase.memberId());
             }
         }
-        return false;
+        return Optional.empty();
     }
 
-    private static String generatePassphrase() {
-        String[] words = {
-                "anchor", "atlas", "brisk", "canyon", "cedar", "comet", "copper", "delta",
-                "ember", "falcon", "frost", "harbor", "hazel", "indigo", "jasmine", "keystone",
-                "lantern", "maple", "matrix", "meadow", "meteor", "nebula", "onyx", "orchid",
-                "polar", "quartz", "raven", "river", "saffron", "signal", "silver", "summit",
-                "timber", "tundra", "velvet", "vertex", "violet", "wander", "willow", "zenith"
-        };
-        return pick(words) + "-" + pick(words) + "-" + pick(words) + "-" + pick(words)
-                + "-" + (1000 + RANDOM.nextInt(9000));
-    }
-
-    private static String pick(String[] words) {
-        return words[RANDOM.nextInt(words.length)];
+    private void appendAuditLog(String memberId, List<String> hosts) throws IOException {
+        String line = Instant.now() + " member=" + memberId + " servers=" + String.join(",", hosts) + System.lineSeparator();
+        Files.writeString(appDir.resolve(AUDIT_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
     }
 
     private void handleJob(HttpExchange exchange) throws IOException {
@@ -259,6 +240,7 @@ public final class DnfUpdateApp {
 
     private void runJob(Job job) {
         job.add("system", "info", "Started job for " + job.hosts.size() + " server(s).");
+        job.add("system", "info", "Patch authorized by " + job.authorizedMember + " for servers: " + String.join(", ", job.hosts));
         Semaphore semaphore = new Semaphore(job.settings.concurrency);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
@@ -463,6 +445,20 @@ public final class DnfUpdateApp {
         return Optional.ofNullable(e.getMessage()).orElse(e.getClass().getSimpleName()).replace("\"", "'");
     }
 
+    private static String sha256Hex(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(bytes.length * 2);
+            for (byte b : bytes) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available.", e);
+        }
+    }
+
     private static boolean constantTimeEquals(String left, String right) {
         byte[] leftBytes = left.getBytes(StandardCharsets.UTF_8);
         byte[] rightBytes = right.getBytes(StandardCharsets.UTF_8);
@@ -513,20 +509,25 @@ public final class DnfUpdateApp {
     ) {
     }
 
+    private record AuthPassphrase(String memberId, String sha256Hex) {
+    }
+
     private static final class Job {
         private final String id;
         private final List<String> hosts;
         private final Settings settings;
+        private final String authorizedMember;
         private final ConcurrentLinkedDeque<Event> events = new ConcurrentLinkedDeque<>();
         private final Map<String, String> hostStatus = new ConcurrentHashMap<>();
         private final AtomicBoolean finished = new AtomicBoolean(false);
         private final AtomicInteger succeeded = new AtomicInteger(0);
         private final AtomicInteger failed = new AtomicInteger(0);
 
-        private Job(String id, List<String> hosts, Settings settings) {
+        private Job(String id, List<String> hosts, Settings settings, String authorizedMember) {
             this.id = id;
             this.hosts = List.copyOf(hosts);
             this.settings = settings;
+            this.authorizedMember = authorizedMember;
             hosts.forEach(host -> hostStatus.put(host, "queued"));
         }
 
