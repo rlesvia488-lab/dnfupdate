@@ -1,0 +1,19 @@
+# DNF Security Update Console authorized passphrases
+#
+# Give one passphrase to each authorized member.
+# These passphrases correspond to the hashed values embedded in the JAR.
+
+member-01: cedar-orchid-summit-quartz-4827
+member-02: nebula-harbor-velvet-copper-9135
+member-03: falcon-indigo-maple-signal-2604
+member-04: river-lantern-onyx-tundra-7351
+member-05: jasmine-meteor-anchor-violet-6048
+member-06: polar-canyon-saffron-matrix-1579
+member-07: timber-hazel-comet-wander-8296
+member-08: keystone-frost-silver-meadow-3417
+member-09: brisk-atlas-vertex-ember-5902
+member-10: willow-delta-raven-quartz-7683
+member-11: orchid-summit-copper-falcon-2146
+member-12: harbor-violet-timber-nebula-9850
+member-13: matrix-cedar-lantern-polar-4369
+member-14: signal-maple-onyx-jasmine-6724
