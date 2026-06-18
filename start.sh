@@ -31,6 +31,7 @@ else
 fi
 export VAULT_CONTEXT="${VAULT_CONTEXT:-${TRIGRAM:-dnf}/${COMPONENT:-update}/${ENV:-local}/default}"
 export VAULT_NAMESPACE="${VAULT_NAMESPACE:-myVault/${VAULT_NAMESPACE_VALUE:-default}}"
+export VAULT_TECH_ACCOUNTS_PATH="${VAULT_TECH_ACCOUNTS_PATH:-${VAULT_CONTEXT}}"
 
 JVM_MIN="${JVM_MIN:-256m}"
 JVM_MAX="${JVM_MAX:-512m}"
@@ -72,6 +73,7 @@ exec java -server "-Xms${JVM_MIN}" "-Xmx${JVM_MAX}" \
   -Dspring.cloud.vault.read-timeout=15000 \
   -Dspring.cloud.vault.config.order=-10 \
   -Dspring.cloud.vault.namespace="${VAULT_NAMESPACE}" \
+  -Ddnfupdate.vault.technical-accounts-path="${VAULT_TECH_ACCOUNTS_PATH}" \
   -Dunibank.service.version="${UNIBANK_SERVICE_VERSION}" \
   "${SECURITY_ARGS[@]}" \
   -jar "${JAR_PATH}" \

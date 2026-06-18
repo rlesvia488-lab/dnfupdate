@@ -32,9 +32,13 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -60,6 +64,9 @@ public final class DnfUpdateApp {
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
     private static final String STATUS_LOG_FILE = "status-checks.tsv";
     private static final String REPORT_DIR = "reports";
+    private static final String OAUTH_TOKEN_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+    private static final String OCS_SERVERS_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+    private static final String OCS_SERVER_ACTION_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
     private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
     private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
@@ -98,6 +105,7 @@ public final class DnfUpdateApp {
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
     private final Path appDir;
     private volatile VaultStatus vaultStatus = VaultStatus.disabled("Vault is disabled.");
+    private volatile String vaultClientToken = "";
 
     private DnfUpdateApp(Path appDir) {
         this.appDir = appDir;
@@ -170,11 +178,14 @@ public final class DnfUpdateApp {
             HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             Optional<String> token = extractJsonString(response.body(), "client_token");
             if (response.statusCode() >= 200 && response.statusCode() < 300 && token.isPresent()) {
+                vaultClientToken = token.get();
                 vaultStatus = VaultStatus.up(config, "Connected to Vault with AppRole. Token was received and kept only in memory for the login check.");
             } else {
+                vaultClientToken = "";
                 vaultStatus = VaultStatus.down(config, "Vault AppRole login failed with HTTP " + response.statusCode() + ".");
             }
         } catch (Exception e) {
+            vaultClientToken = "";
             vaultStatus = VaultStatus.down(config, "Vault connection failed: " + cleanMessage(e));
         }
     }
@@ -560,33 +571,25 @@ public final class DnfUpdateApp {
     }
 
     private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report, String bootIdBefore) {
-        Session verificationSession = null;
-        long deadline = System.currentTimeMillis() + REBOOT_VERIFY_TIMEOUT_MILLIS;
-        int attempt = 1;
-        Exception lastFailure = null;
         job.add(host, "info", "Starting post-reboot SSH checks every 10 seconds for up to 5 minutes.");
-        while (System.currentTimeMillis() <= deadline) {
-            try {
-                job.add(host, "info", "Post-reboot SSH check attempt " + attempt + ".");
-                verificationSession = connect(job, host);
-                break;
-            } catch (Exception e) {
-                lastFailure = e;
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    break;
-                }
-                sleep(Math.min(REBOOT_VERIFY_INTERVAL_MILLIS, remaining));
-                attempt++;
-            }
-        }
+        SshWaitResult sshWait = waitForSsh(job, host, "Post-reboot SSH check attempt ");
+        Session verificationSession = sshWait.session();
 
         if (verificationSession == null) {
-            report.machineUpAfterReboot = false;
-            report.serviceUpAfterReboot = false;
             job.add(host, "error", "Server was not reachable over SSH within 5 minutes after reboot. Last error: "
-                    + (lastFailure == null ? "timeout" : cleanMessage(lastFailure)));
-            return new PostRebootStatus(false, false, Optional.empty());
+                    + (sshWait.lastFailure() == null ? "timeout" : cleanMessage(sshWait.lastFailure())));
+            if (forceHardRebootWithCloudApi(job, host)) {
+                job.add(host, "info", "Hard reboot API request was accepted. Checking SSH every 10 seconds for up to 5 minutes.");
+                sshWait = waitForSsh(job, host, "Post-hard-reboot SSH check attempt ");
+                verificationSession = sshWait.session();
+            }
+            if (verificationSession == null) {
+                report.machineUpAfterReboot = false;
+                report.serviceUpAfterReboot = false;
+                job.add(host, "error", "Server was still not reachable over SSH after hard reboot API recovery. Last error: "
+                        + (sshWait.lastFailure() == null ? "timeout" : cleanMessage(sshWait.lastFailure())));
+                return new PostRebootStatus(false, false, Optional.empty());
+            }
         }
 
         try {
@@ -630,6 +633,266 @@ public final class DnfUpdateApp {
                 verificationSession.disconnect();
             }
         }
+    }
+
+    private SshWaitResult waitForSsh(Job job, String host, String attemptPrefix) {
+        long deadline = System.currentTimeMillis() + REBOOT_VERIFY_TIMEOUT_MILLIS;
+        int attempt = 1;
+        Exception lastFailure = null;
+        while (System.currentTimeMillis() <= deadline) {
+            try {
+                job.add(host, "info", attemptPrefix + attempt + ".");
+                return new SshWaitResult(connect(job, host), null);
+            } catch (Exception e) {
+                lastFailure = e;
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    break;
+                }
+                sleep(Math.min(REBOOT_VERIFY_INTERVAL_MILLIS, remaining));
+                attempt++;
+            }
+        }
+        return new SshWaitResult(null, lastFailure);
+    }
+
+    private boolean forceHardRebootWithCloudApi(Job job, String host) {
+        VaultConfig config = vaultStatus.config();
+        if (!"UP".equals(vaultStatus.state()) || vaultClientToken.isBlank()) {
+            job.add(host, "error", "Cannot call hard reboot API because Vault is not connected.");
+            return false;
+        }
+        try {
+            List<TechnicalAccount> accounts = loadTechnicalAccounts(config);
+            if (accounts.isEmpty()) {
+                job.add(host, "error", "No technical accounts found in Vault secret " + config.technicalAccountsPath() + ".");
+                return false;
+            }
+            job.add(host, "info", "Trying hard reboot API recovery with " + accounts.size() + " technical account(s) from Vault.");
+            for (TechnicalAccount account : accounts) {
+                try {
+                    job.add(host, "info", "Requesting CMAAS OAuth token for account " + account.accountId() + ".");
+                    String accessToken = requestCmaasToken(account);
+                    Optional<CloudServer> server = findCloudServer(host, accessToken);
+                    if (server.isEmpty()) {
+                        job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host + " in OCS.");
+                        continue;
+                    }
+                    sendHardReboot(server.get(), accessToken);
+                    job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
+                            + " (" + server.get().name() + ") using account " + account.accountId() + ".");
+                    return true;
+                } catch (Exception e) {
+                    job.add(host, "warn", "Hard reboot attempt with account " + account.accountId() + " failed: " + cleanMessage(e));
+                }
+            }
+        } catch (Exception e) {
+            job.add(host, "error", "Unable to run hard reboot API recovery: " + cleanMessage(e));
+        }
+        return false;
+    }
+
+    private List<TechnicalAccount> loadTechnicalAccounts(VaultConfig config) throws IOException, InterruptedException {
+        List<String> candidatePaths = vaultSecretPaths(config.technicalAccountsPath());
+        Exception lastFailure = null;
+        for (String path : candidatePaths) {
+            try {
+                URI uri = URI.create(stripTrailingSlash(config.uri()) + path);
+                HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofMillis(15000))
+                        .header("X-Vault-Token", vaultClientToken)
+                        .GET();
+                if (!config.namespace().isBlank()) {
+                    requestBuilder.header("X-Vault-Namespace", config.namespace());
+                }
+                HttpResponse<String> response = httpClient().send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (response.statusCode() == 404) {
+                    continue;
+                }
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    throw new IOException("Vault secret read failed with HTTP " + response.statusCode());
+                }
+                Object parsed = new JsonParser(response.body()).parse();
+                Object data = vaultDataPayload(parsed);
+                List<TechnicalAccount> accounts = new ArrayList<>();
+                collectTechnicalAccounts(data, accounts, new HashSet<>());
+                return accounts;
+            } catch (Exception e) {
+                lastFailure = e;
+            }
+        }
+        if (lastFailure instanceof IOException ioe) {
+            throw ioe;
+        }
+        if (lastFailure instanceof InterruptedException ie) {
+            throw ie;
+        }
+        if (lastFailure != null) {
+            throw new IOException(lastFailure);
+        }
+        return List.of();
+    }
+
+    private static List<String> vaultSecretPaths(String configuredPath) {
+        String clean = configuredPath == null ? "" : configuredPath.trim();
+        if (clean.isBlank()) {
+            return List.of();
+        }
+        if (clean.startsWith("/v1/")) {
+            return List.of(clean);
+        }
+        clean = clean.replaceFirst("^/+", "");
+        return List.of("/v1/secret/data/" + clean, "/v1/secret/" + clean);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object vaultDataPayload(Object parsed) {
+        if (!(parsed instanceof Map<?, ?> root)) {
+            return parsed;
+        }
+        Object data = root.get("data");
+        if (data instanceof Map<?, ?> firstData) {
+            Object nestedData = firstData.get("data");
+            if (nestedData instanceof Map<?, ?> || nestedData instanceof List<?>) {
+                return nestedData;
+            }
+            return firstData;
+        }
+        return root;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectTechnicalAccounts(Object value, List<TechnicalAccount> accounts, Set<String> seen) {
+        if (value instanceof Map<?, ?> map) {
+            String accountId = firstNonBlank(map, "account_id", "accountId", "account-id");
+            String clientId = firstNonBlank(map, "client_id", "clientId", "client-id");
+            String clientSecret = firstNonBlank(map, "client_secret", "clientSecret", "client-secret");
+            if (!accountId.isBlank() && !clientId.isBlank() && !clientSecret.isBlank()) {
+                String key = accountId + "\n" + clientId;
+                if (seen.add(key)) {
+                    accounts.add(new TechnicalAccount(accountId, clientId, clientSecret));
+                }
+            }
+            for (Object nested : map.values()) {
+                collectTechnicalAccounts(nested, accounts, seen);
+            }
+        } else if (value instanceof Collection<?> collection) {
+            for (Object nested : collection) {
+                collectTechnicalAccounts(nested, accounts, seen);
+            }
+        }
+    }
+
+    private static String firstNonBlank(Map<?, ?> map, String... keys) {
+        for (String key : keys) {
+            String value = stringValue(map.get(key));
+            if (!value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    private String requestCmaasToken(TechnicalAccount account) throws IOException, InterruptedException {
+        String scope = account.accountId() + ":sgcp:cmaas:write_node "
+                + account.accountId() + ":sgcp:cmaas:read "
+                + account.accountId() + ":sgcp:lbaas:read "
+                + account.accountId() + ":sgcp:ocs:read "
+                + account.accountId() + ":sgcp:files:read "
+                + account.accountId() + ":sgcp:files:write";
+        String body = "grant_type=client_credentials&scope=" + URLEncoder.encode(scope, StandardCharsets.UTF_8);
+        String basic = Base64.getEncoder().encodeToString((account.clientId() + ":" + account.clientSecret()).getBytes(StandardCharsets.UTF_8));
+        HttpRequest request = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
+                .timeout(Duration.ofMillis(15000))
+                .header("Authorization", "Basic " + basic)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("OAuth token request failed with HTTP " + response.statusCode());
+        }
+        Object parsed = new JsonParser(response.body()).parse();
+        String token = findString(parsed, "access_token");
+        if (token.isBlank()) {
+            throw new IOException("OAuth response did not contain access_token");
+        }
+        return token;
+    }
+
+    private Optional<CloudServer> findCloudServer(String host, String accessToken) throws IOException, InterruptedException {
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                HttpRequest request = HttpRequest.newBuilder(URI.create(OCS_SERVERS_URL))
+                        .timeout(Duration.ofMillis(15000))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + accessToken)
+                        .GET()
+                        .build();
+                HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                if (response.statusCode() == 200) {
+                    Object parsed = new JsonParser(response.body()).parse();
+                    return findMatchingServer(parsed, host);
+                }
+                throw new IOException("OCS server list failed with HTTP " + response.statusCode());
+            } catch (Exception e) {
+                lastFailure = e;
+                if (attempt < 3) {
+                    sleep(5000);
+                }
+            }
+        }
+        if (lastFailure instanceof IOException ioe) {
+            throw ioe;
+        }
+        if (lastFailure instanceof InterruptedException ie) {
+            throw ie;
+        }
+        throw new IOException(lastFailure);
+    }
+
+    private static Optional<CloudServer> findMatchingServer(Object parsed, String host) {
+        if (!(parsed instanceof Map<?, ?> root)) {
+            return Optional.empty();
+        }
+        Object servers = root.get("servers");
+        if (!(servers instanceof Collection<?> collection)) {
+            return Optional.empty();
+        }
+        String target = host.trim();
+        for (Object item : collection) {
+            if (!(item instanceof Map<?, ?> server)) {
+                continue;
+            }
+            String accessIp = stringValue(server.get("accessIPv4"));
+            String name = stringValue(server.get("name"));
+            String id = stringValue(server.get("id"));
+            if (!id.isBlank() && (target.equalsIgnoreCase(accessIp) || target.equalsIgnoreCase(name))) {
+                return Optional.of(new CloudServer(id, name.isBlank() ? accessIp : name, accessIp));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private void sendHardReboot(CloudServer server, String accessToken) throws IOException, InterruptedException {
+        String body = "{\"reboot\":{\"type\":\"HARD\"}}";
+        HttpRequest request = HttpRequest.newBuilder(URI.create(String.format(OCS_SERVER_ACTION_URL, urlPathEncode(server.id()))))
+                .timeout(Duration.ofMillis(15000))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + accessToken)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("OCS hard reboot action failed with HTTP " + response.statusCode());
+        }
+    }
+
+    private static HttpClient httpClient() {
+        return HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(5000))
+                .build();
     }
 
     private void appendStatusLog(Job job, String host, PostRebootStatus status) throws IOException {
@@ -1055,6 +1318,7 @@ public final class DnfUpdateApp {
                 .append(row("URI", status.config().uri()))
                 .append(row("Context", status.config().context()))
                 .append(row("Namespace", status.config().namespace()))
+                .append(row("Technical Accounts Path", status.config().technicalAccountsPath()))
                 .append(row("Authentication", "approle"))
                 .append(row("Role ID", status.config().roleId().isBlank() ? "missing" : "configured"))
                 .append(row("Secret ID", status.config().secretId().isBlank() ? "missing" : "configured"))
@@ -1232,6 +1496,37 @@ public final class DnfUpdateApp {
         return diff == 0;
     }
 
+    private static String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private static String findString(Object value, String key) {
+        if (value instanceof Map<?, ?> map) {
+            Object direct = map.get(key);
+            if (direct != null) {
+                return stringValue(direct);
+            }
+            for (Object nested : map.values()) {
+                String found = findString(nested, key);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+        } else if (value instanceof Collection<?> collection) {
+            for (Object nested : collection) {
+                String found = findString(nested, key);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static String urlPathEncode(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
     private static String escapeJson(String value) {
         StringBuilder builder = new StringBuilder(value.length() + 16);
         for (int i = 0; i < value.length(); i++) {
@@ -1308,11 +1603,21 @@ public final class DnfUpdateApp {
     private record PostRebootStatus(boolean machineUp, boolean serviceUp, Optional<String> workingHealthcheck) {
     }
 
+    private record SshWaitResult(Session session, Exception lastFailure) {
+    }
+
+    private record TechnicalAccount(String accountId, String clientId, String clientSecret) {
+    }
+
+    private record CloudServer(String id, String name, String accessIPv4) {
+    }
+
     private record VaultConfig(
             boolean enabled,
             String uri,
             String context,
             String namespace,
+            String technicalAccountsPath,
             String roleId,
             String secretId
     ) {
@@ -1322,6 +1627,8 @@ public final class DnfUpdateApp {
                     runtimeValue("VAULT_URI", "spring.cloud.vault.uri", ""),
                     runtimeValue("VAULT_CONTEXT", "spring.cloud.vault.kv.default-context", ""),
                     runtimeValue("VAULT_NAMESPACE", "spring.cloud.vault.namespace", ""),
+                    runtimeValue("VAULT_TECH_ACCOUNTS_PATH", "dnfupdate.vault.technical-accounts-path",
+                            runtimeValue("VAULT_CONTEXT", "spring.cloud.vault.kv.default-context", "")),
                     runtimeValue("VAULT_ROLE_ID", "spring.cloud.vault.app-role.role-id", ""),
                     runtimeValue("VAULT_SECRET_ID", "spring.cloud.vault.app-role.secret-id", "")
             );
@@ -1454,6 +1761,183 @@ public final class DnfUpdateApp {
                     + "\"level\":\"" + escapeJson(level.toLowerCase(Locale.ROOT)) + "\","
                     + "\"message\":\"" + escapeJson(message) + "\""
                     + "}";
+        }
+    }
+
+    private static final class JsonParser {
+        private final String text;
+        private int index;
+
+        private JsonParser(String text) {
+            this.text = text == null ? "" : text;
+        }
+
+        private Object parse() throws IOException {
+            Object value = parseValue();
+            skipWhitespace();
+            if (index != text.length()) {
+                throw new IOException("Unexpected JSON content at position " + index);
+            }
+            return value;
+        }
+
+        private Object parseValue() throws IOException {
+            skipWhitespace();
+            if (index >= text.length()) {
+                throw new IOException("Unexpected end of JSON");
+            }
+            char ch = text.charAt(index);
+            return switch (ch) {
+                case '{' -> parseObject();
+                case '[' -> parseArray();
+                case '"' -> parseString();
+                case 't' -> parseLiteral("true", Boolean.TRUE);
+                case 'f' -> parseLiteral("false", Boolean.FALSE);
+                case 'n' -> parseLiteral("null", null);
+                default -> {
+                    if (ch == '-' || Character.isDigit(ch)) {
+                        yield parseNumber();
+                    }
+                    throw new IOException("Unexpected JSON character at position " + index);
+                }
+            };
+        }
+
+        private Map<String, Object> parseObject() throws IOException {
+            expect('{');
+            Map<String, Object> map = new LinkedHashMap<>();
+            skipWhitespace();
+            if (peek('}')) {
+                index++;
+                return map;
+            }
+            while (true) {
+                String key = parseString();
+                skipWhitespace();
+                expect(':');
+                map.put(key, parseValue());
+                skipWhitespace();
+                if (peek('}')) {
+                    index++;
+                    return map;
+                }
+                expect(',');
+            }
+        }
+
+        private List<Object> parseArray() throws IOException {
+            expect('[');
+            List<Object> list = new ArrayList<>();
+            skipWhitespace();
+            if (peek(']')) {
+                index++;
+                return list;
+            }
+            while (true) {
+                list.add(parseValue());
+                skipWhitespace();
+                if (peek(']')) {
+                    index++;
+                    return list;
+                }
+                expect(',');
+            }
+        }
+
+        private String parseString() throws IOException {
+            expect('"');
+            StringBuilder builder = new StringBuilder();
+            while (index < text.length()) {
+                char ch = text.charAt(index++);
+                if (ch == '"') {
+                    return builder.toString();
+                }
+                if (ch == '\\') {
+                    if (index >= text.length()) {
+                        throw new IOException("Invalid JSON escape");
+                    }
+                    char escaped = text.charAt(index++);
+                    switch (escaped) {
+                        case '"', '\\', '/' -> builder.append(escaped);
+                        case 'b' -> builder.append('\b');
+                        case 'f' -> builder.append('\f');
+                        case 'n' -> builder.append('\n');
+                        case 'r' -> builder.append('\r');
+                        case 't' -> builder.append('\t');
+                        case 'u' -> {
+                            if (index + 4 > text.length()) {
+                                throw new IOException("Invalid JSON unicode escape");
+                            }
+                            String hex = text.substring(index, index + 4);
+                            builder.append((char) Integer.parseInt(hex, 16));
+                            index += 4;
+                        }
+                        default -> throw new IOException("Invalid JSON escape");
+                    }
+                } else {
+                    builder.append(ch);
+                }
+            }
+            throw new IOException("Unterminated JSON string");
+        }
+
+        private Object parseNumber() throws IOException {
+            int start = index;
+            if (peek('-')) {
+                index++;
+            }
+            while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                index++;
+            }
+            if (peek('.')) {
+                index++;
+                while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                    index++;
+                }
+            }
+            if (index < text.length() && (text.charAt(index) == 'e' || text.charAt(index) == 'E')) {
+                index++;
+                if (index < text.length() && (text.charAt(index) == '+' || text.charAt(index) == '-')) {
+                    index++;
+                }
+                while (index < text.length() && Character.isDigit(text.charAt(index))) {
+                    index++;
+                }
+            }
+            String number = text.substring(start, index);
+            try {
+                return number.contains(".") || number.contains("e") || number.contains("E")
+                        ? Double.parseDouble(number)
+                        : Long.parseLong(number);
+            } catch (NumberFormatException e) {
+                throw new IOException("Invalid JSON number");
+            }
+        }
+
+        private Object parseLiteral(String literal, Object value) throws IOException {
+            if (!text.startsWith(literal, index)) {
+                throw new IOException("Invalid JSON literal at position " + index);
+            }
+            index += literal.length();
+            return value;
+        }
+
+        private void expect(char expected) throws IOException {
+            skipWhitespace();
+            if (index >= text.length() || text.charAt(index) != expected) {
+                throw new IOException("Expected '" + expected + "' at position " + index);
+            }
+            index++;
+        }
+
+        private boolean peek(char expected) {
+            return index < text.length() && text.charAt(index) == expected;
+        }
+
+        private void skipWhitespace() {
+            while (index < text.length() && Character.isWhitespace(text.charAt(index))) {
+                index++;
+            }
         }
     }
 
