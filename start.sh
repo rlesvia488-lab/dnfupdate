@@ -24,16 +24,10 @@ if [ "${VAULT_ENABLED}" = "true" ]; then
   export VAULT_URI="${VAULT_URI:?Set VAULT_URI, for example https://vault.example.com}"
   export VAULT_ROLE_ID="${VAULT_ROLE_ID:?Set VAULT_ROLE_ID}"
   export VAULT_SECRET_ID="${VAULT_SECRET_ID:?Set VAULT_SECRET_ID}"
-  export CMAAS_OAUTH_TOKEN_URL="${CMAAS_OAUTH_TOKEN_URL:?Set CMAAS_OAUTH_TOKEN_URL}"
-  export OCS_SERVERS_URL="${OCS_SERVERS_URL:?Set OCS_SERVERS_URL}"
-  export OCS_SERVER_ACTION_URL="${OCS_SERVER_ACTION_URL:?Set OCS_SERVER_ACTION_URL}"
 else
   export VAULT_URI="${VAULT_URI:-}"
   export VAULT_ROLE_ID="${VAULT_ROLE_ID:-}"
   export VAULT_SECRET_ID="${VAULT_SECRET_ID:-}"
-  export CMAAS_OAUTH_TOKEN_URL="${CMAAS_OAUTH_TOKEN_URL:-}"
-  export OCS_SERVERS_URL="${OCS_SERVERS_URL:-}"
-  export OCS_SERVER_ACTION_URL="${OCS_SERVER_ACTION_URL:-}"
 fi
 export VAULT_CONTEXT="${VAULT_CONTEXT:-${TRIGRAM:-dnf}/${COMPONENT:-update}/${ENV:-local}/default}"
 export VAULT_NAMESPACE="${VAULT_NAMESPACE:-myVault/${VAULT_NAMESPACE_VALUE:-default}}"
@@ -80,9 +74,6 @@ exec java -server "-Xms${JVM_MIN}" "-Xmx${JVM_MAX}" \
   -Dspring.cloud.vault.config.order=-10 \
   -Dspring.cloud.vault.namespace="${VAULT_NAMESPACE}" \
   -Ddnfupdate.vault.technical-accounts-path="${VAULT_TECH_ACCOUNTS_PATH}" \
-  -Ddnfupdate.cmaas.oauth-token-url="${CMAAS_OAUTH_TOKEN_URL}" \
-  -Ddnfupdate.ocs.servers-url="${OCS_SERVERS_URL}" \
-  -Ddnfupdate.ocs.server-action-url="${OCS_SERVER_ACTION_URL}" \
   -Dunibank.service.version="${UNIBANK_SERVICE_VERSION}" \
   "${SECURITY_ARGS[@]}" \
   -jar "${JAR_PATH}" \

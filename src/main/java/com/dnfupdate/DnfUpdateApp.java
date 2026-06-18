@@ -660,22 +660,26 @@ public final class DnfUpdateApp {
             return false;
         }
         try {
-            List<TechnicalAccount> accounts = loadTechnicalAccounts(config);
-            if (accounts.isEmpty()) {
+            CloudRecoveryConfig recoveryConfig = loadCloudRecoveryConfig(config);
+            if (recoveryConfig.accounts().isEmpty()) {
                 job.add(host, "error", "No technical accounts found in Vault secret " + config.technicalAccountsPath() + ".");
                 return false;
             }
-            job.add(host, "info", "Trying hard reboot API recovery with " + accounts.size() + " technical account(s) from Vault.");
-            for (TechnicalAccount account : accounts) {
+            if (!recoveryConfig.isComplete()) {
+                job.add(host, "error", "Cloud API URLs are missing from Vault secret " + config.technicalAccountsPath() + ".");
+                return false;
+            }
+            job.add(host, "info", "Trying hard reboot API recovery with " + recoveryConfig.accounts().size() + " technical account(s) from Vault.");
+            for (TechnicalAccount account : recoveryConfig.accounts()) {
                 try {
                     job.add(host, "info", "Requesting CMAAS OAuth token for account " + account.accountId() + ".");
-                    String accessToken = requestCmaasToken(account, config);
-                    Optional<CloudServer> server = findCloudServer(host, accessToken, config);
+                    String accessToken = requestCmaasToken(account, recoveryConfig);
+                    Optional<CloudServer> server = findCloudServer(host, accessToken, recoveryConfig);
                     if (server.isEmpty()) {
                         job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host + " in OCS.");
                         continue;
                     }
-                    sendHardReboot(server.get(), accessToken, config);
+                    sendHardReboot(server.get(), accessToken, recoveryConfig);
                     job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
                             + " (" + server.get().name() + ") using account " + account.accountId() + ".");
                     return true;
@@ -689,7 +693,7 @@ public final class DnfUpdateApp {
         return false;
     }
 
-    private List<TechnicalAccount> loadTechnicalAccounts(VaultConfig config) throws IOException, InterruptedException {
+    private CloudRecoveryConfig loadCloudRecoveryConfig(VaultConfig config) throws IOException, InterruptedException {
         List<String> candidatePaths = vaultSecretPaths(config.technicalAccountsPath());
         Exception lastFailure = null;
         for (String path : candidatePaths) {
@@ -713,7 +717,12 @@ public final class DnfUpdateApp {
                 Object data = vaultDataPayload(parsed);
                 List<TechnicalAccount> accounts = new ArrayList<>();
                 collectTechnicalAccounts(data, accounts, new HashSet<>());
-                return accounts;
+                return new CloudRecoveryConfig(
+                        accounts,
+                        findFirstString(data, "cmaas_oauth_token_url", "cmaasOauthTokenUrl", "oauth_token_url", "oauthTokenUrl"),
+                        findFirstString(data, "ocs_servers_url", "ocsServersUrl", "servers_url", "serversUrl"),
+                        findFirstString(data, "ocs_server_action_url", "ocsServerActionUrl", "server_action_url", "serverActionUrl")
+                );
             } catch (Exception e) {
                 lastFailure = e;
             }
@@ -727,7 +736,7 @@ public final class DnfUpdateApp {
         if (lastFailure != null) {
             throw new IOException(lastFailure);
         }
-        return List.of();
+        return new CloudRecoveryConfig(List.of(), "", "", "");
     }
 
     private static List<String> vaultSecretPaths(String configuredPath) {
@@ -790,9 +799,32 @@ public final class DnfUpdateApp {
         return "";
     }
 
-    private String requestCmaasToken(TechnicalAccount account, VaultConfig config) throws IOException, InterruptedException {
+    private static String findFirstString(Object value, String... keys) {
+        if (value instanceof Map<?, ?> map) {
+            String direct = firstNonBlank(map, keys);
+            if (!direct.isBlank()) {
+                return direct;
+            }
+            for (Object nested : map.values()) {
+                String found = findFirstString(nested, keys);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+        } else if (value instanceof Collection<?> collection) {
+            for (Object nested : collection) {
+                String found = findFirstString(nested, keys);
+                if (!found.isBlank()) {
+                    return found;
+                }
+            }
+        }
+        return "";
+    }
+
+    private String requestCmaasToken(TechnicalAccount account, CloudRecoveryConfig config) throws IOException, InterruptedException {
         if (config.oauthTokenUrl().isBlank()) {
-            throw new IOException("CMAAS_OAUTH_TOKEN_URL is not configured");
+            throw new IOException("CMAAS OAuth token URL is missing from Vault");
         }
         String scope = account.accountId() + ":sgcp:cmaas:write_node "
                 + account.accountId() + ":sgcp:cmaas:read "
@@ -820,9 +852,9 @@ public final class DnfUpdateApp {
         return token;
     }
 
-    private Optional<CloudServer> findCloudServer(String host, String accessToken, VaultConfig config) throws IOException, InterruptedException {
+    private Optional<CloudServer> findCloudServer(String host, String accessToken, CloudRecoveryConfig config) throws IOException, InterruptedException {
         if (config.ocsServersUrl().isBlank()) {
-            throw new IOException("OCS_SERVERS_URL is not configured");
+            throw new IOException("OCS servers URL is missing from Vault");
         }
         Exception lastFailure = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
@@ -878,9 +910,9 @@ public final class DnfUpdateApp {
         return Optional.empty();
     }
 
-    private void sendHardReboot(CloudServer server, String accessToken, VaultConfig config) throws IOException, InterruptedException {
+    private void sendHardReboot(CloudServer server, String accessToken, CloudRecoveryConfig config) throws IOException, InterruptedException {
         if (config.ocsServerActionUrl().isBlank()) {
-            throw new IOException("OCS_SERVER_ACTION_URL is not configured");
+            throw new IOException("OCS server action URL is missing from Vault");
         }
         String body = "{\"reboot\":{\"type\":\"HARD\"}}";
         HttpRequest request = HttpRequest.newBuilder(URI.create(serverActionUrl(config.ocsServerActionUrl(), server.id())))
@@ -1325,9 +1357,7 @@ public final class DnfUpdateApp {
                 .append(row("Context", status.config().context()))
                 .append(row("Namespace", status.config().namespace()))
                 .append(row("Technical Accounts Path", status.config().technicalAccountsPath()))
-                .append(row("CMAAS OAuth Token URL", status.config().oauthTokenUrl().isBlank() ? "missing" : "configured"))
-                .append(row("OCS Servers URL", status.config().ocsServersUrl().isBlank() ? "missing" : "configured"))
-                .append(row("OCS Server Action URL", status.config().ocsServerActionUrl().isBlank() ? "missing" : "configured"))
+                .append(row("Cloud API URLs", "read from Vault technical accounts secret"))
                 .append(row("Authentication", "approle"))
                 .append(row("Role ID", status.config().roleId().isBlank() ? "missing" : "configured"))
                 .append(row("Secret ID", status.config().secretId().isBlank() ? "missing" : "configured"))
@@ -1632,15 +1662,23 @@ public final class DnfUpdateApp {
     private record CloudServer(String id, String name, String accessIPv4) {
     }
 
+    private record CloudRecoveryConfig(
+            List<TechnicalAccount> accounts,
+            String oauthTokenUrl,
+            String ocsServersUrl,
+            String ocsServerActionUrl
+    ) {
+        private boolean isComplete() {
+            return !oauthTokenUrl.isBlank() && !ocsServersUrl.isBlank() && !ocsServerActionUrl.isBlank();
+        }
+    }
+
     private record VaultConfig(
             boolean enabled,
             String uri,
             String context,
             String namespace,
             String technicalAccountsPath,
-            String oauthTokenUrl,
-            String ocsServersUrl,
-            String ocsServerActionUrl,
             String roleId,
             String secretId
     ) {
@@ -1652,9 +1690,6 @@ public final class DnfUpdateApp {
                     runtimeValue("VAULT_NAMESPACE", "spring.cloud.vault.namespace", ""),
                     runtimeValue("VAULT_TECH_ACCOUNTS_PATH", "dnfupdate.vault.technical-accounts-path",
                             runtimeValue("VAULT_CONTEXT", "spring.cloud.vault.kv.default-context", "")),
-                    runtimeValue("CMAAS_OAUTH_TOKEN_URL", "dnfupdate.cmaas.oauth-token-url", ""),
-                    runtimeValue("OCS_SERVERS_URL", "dnfupdate.ocs.servers-url", ""),
-                    runtimeValue("OCS_SERVER_ACTION_URL", "dnfupdate.ocs.server-action-url", ""),
                     runtimeValue("VAULT_ROLE_ID", "spring.cloud.vault.app-role.role-id", ""),
                     runtimeValue("VAULT_SECRET_ID", "spring.cloud.vault.app-role.secret-id", "")
             );
