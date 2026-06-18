@@ -19,11 +19,15 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.URLDecoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -93,6 +97,7 @@ public final class DnfUpdateApp {
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
     private final Path appDir;
+    private volatile VaultStatus vaultStatus = VaultStatus.disabled("Vault is disabled.");
 
     private DnfUpdateApp(Path appDir) {
         this.appDir = appDir;
@@ -105,10 +110,12 @@ public final class DnfUpdateApp {
 
         Path appDir = findAppDir();
         DnfUpdateApp app = new DnfUpdateApp(appDir);
+        app.initializeVault();
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/patching", app::handlePatching);
         server.createContext("/dryrun", app::handleDryRunReports);
         server.createContext("/status", app::handleStatus);
+        server.createContext("/vault", app::handleVault);
         server.createContext("/reports", app::handleReportFile);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
@@ -120,6 +127,7 @@ public final class DnfUpdateApp {
         System.out.println("Patch audit log: " + appDir.resolve(AUDIT_LOG_FILE).toAbsolutePath());
         System.out.println("Post-reboot status log: " + appDir.resolve(STATUS_LOG_FILE).toAbsolutePath());
         System.out.println("HTML reports directory: " + appDir.resolve(REPORT_DIR).toAbsolutePath());
+        System.out.println("Vault status: " + app.vaultStatus.state() + " - " + app.vaultStatus.message());
     }
 
     private static Path findAppDir() {
@@ -132,6 +140,85 @@ public final class DnfUpdateApp {
         } catch (Exception ignored) {
             return Path.of(".").toAbsolutePath().normalize();
         }
+    }
+
+    private void initializeVault() {
+        VaultConfig config = VaultConfig.fromRuntime();
+        if (!config.enabled()) {
+            vaultStatus = VaultStatus.disabled("Vault is disabled. Set VAULT_ENABLED=true in start.sh to enable it.");
+            return;
+        }
+        if (config.uri().isBlank() || config.roleId().isBlank() || config.secretId().isBlank()) {
+            vaultStatus = VaultStatus.down(config, "Vault is enabled, but VAULT_URI, VAULT_ROLE_ID, or VAULT_SECRET_ID is missing.");
+            return;
+        }
+
+        try {
+            URI loginUri = URI.create(stripTrailingSlash(config.uri()) + "/v1/auth/approle/login");
+            String body = "{\"role_id\":\"" + escapeJson(config.roleId()) + "\",\"secret_id\":\"" + escapeJson(config.secretId()) + "\"}";
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(loginUri)
+                    .timeout(Duration.ofMillis(5000))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+            if (!config.namespace().isBlank()) {
+                requestBuilder.header("X-Vault-Namespace", config.namespace());
+            }
+
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofMillis(5000))
+                    .build();
+            HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            Optional<String> token = extractJsonString(response.body(), "client_token");
+            if (response.statusCode() >= 200 && response.statusCode() < 300 && token.isPresent()) {
+                vaultStatus = VaultStatus.up(config, "Connected to Vault with AppRole. Token was received and kept only in memory for the login check.");
+            } else {
+                vaultStatus = VaultStatus.down(config, "Vault AppRole login failed with HTTP " + response.statusCode() + ".");
+            }
+        } catch (Exception e) {
+            vaultStatus = VaultStatus.down(config, "Vault connection failed: " + cleanMessage(e));
+        }
+    }
+
+    private static String stripTrailingSlash(String value) {
+        String result = value.trim();
+        while (result.endsWith("/")) {
+            result = result.substring(0, result.length() - 1);
+        }
+        return result;
+    }
+
+    private static Optional<String> extractJsonString(String json, String key) {
+        if (json == null || json.isBlank()) {
+            return Optional.empty();
+        }
+        Pattern pattern = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+        Matcher matcher = pattern.matcher(json);
+        if (!matcher.find()) {
+            return Optional.empty();
+        }
+        return Optional.of(unescapeJsonString(matcher.group(1)));
+    }
+
+    private static String unescapeJsonString(String value) {
+        StringBuilder builder = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch == '\\' && i + 1 < value.length()) {
+                char next = value.charAt(++i);
+                switch (next) {
+                    case '"', '\\', '/' -> builder.append(next);
+                    case 'b' -> builder.append('\b');
+                    case 'f' -> builder.append('\f');
+                    case 'n' -> builder.append('\n');
+                    case 'r' -> builder.append('\r');
+                    case 't' -> builder.append('\t');
+                    default -> builder.append(next);
+                }
+            } else {
+                builder.append(ch);
+            }
+        }
+        return builder.toString();
     }
 
     private void handleIndex(HttpExchange exchange) throws IOException {
@@ -150,6 +237,10 @@ public final class DnfUpdateApp {
         }
         if ("/dryrun".equals(path) || "/dryrun/".equals(path)) {
             send(exchange, 200, "text/html; charset=utf-8", buildReportsIndex(ReportKind.DRY_RUN));
+            return;
+        }
+        if ("/vault".equals(path) || "/vault/".equals(path)) {
+            send(exchange, 200, "text/html; charset=utf-8", buildVaultPage());
             return;
         }
         send(exchange, 200, "text/html; charset=utf-8", Html.INDEX);
@@ -177,6 +268,14 @@ public final class DnfUpdateApp {
             return;
         }
         send(exchange, 200, "text/html; charset=utf-8", buildStatusPage());
+    }
+
+    private void handleVault(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "text/plain", "Method not allowed");
+            return;
+        }
+        send(exchange, 200, "text/html; charset=utf-8", buildVaultPage());
     }
 
     private void handleReportFile(HttpExchange exchange) throws IOException {
@@ -904,6 +1003,76 @@ public final class DnfUpdateApp {
         return html.toString();
     }
 
+    private String buildVaultPage() {
+        VaultStatus status = vaultStatus;
+        String stateClass = switch (status.state()) {
+            case "UP" -> "up";
+            case "DOWN" -> "down";
+            default -> "disabled";
+        };
+        StringBuilder html = new StringBuilder();
+        html.append("""
+                <!doctype html>
+                <html lang="en">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <title>Vault Status</title>
+                  <style>
+                    body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #f4f7fb; }
+                    main { width: min(860px, calc(100vw - 32px)); margin: 0 auto; padding: 24px 0; }
+                    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 18px; }
+                    h1 { margin: 0; font-size: 26px; }
+                    a { color: #1d4ed8; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                    .button { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; background: #fff; }
+                    .panel { background: #fff; border: 1px solid #d8dee9; border-radius: 8px; padding: 18px; }
+                    .state { display: inline-block; border-radius: 999px; padding: 5px 10px; font-weight: 800; font-size: 13px; }
+                    .up { color: #15803d; background: #dcfce7; }
+                    .down { color: #b91c1c; background: #fee2e2; }
+                    .disabled { color: #64748b; background: #e2e8f0; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+                    th, td { border-top: 1px solid #d8dee9; padding: 10px; text-align: left; vertical-align: top; }
+                    th { width: 210px; color: #64748b; font-size: 13px; }
+                    .muted { color: #64748b; font-size: 13px; }
+                  </style>
+                </head>
+                <body>
+                <main>
+                  <header>
+                    <div>
+                      <h1>Vault Status</h1>
+                      <div class="muted">AppRole connection status from startup configuration</div>
+                    </div>
+                    <a class="button" href="/">Update Console</a>
+                  </header>
+                  <section class="panel">
+                """);
+        html.append("<div class=\"state ").append(stateClass).append("\">").append(escapeHtml(status.state())).append("</div>");
+        html.append("<p>").append(escapeHtml(status.message())).append("</p>");
+        html.append("<table><tbody>")
+                .append(row("Enabled", Boolean.toString(status.config().enabled())))
+                .append(row("URI", status.config().uri()))
+                .append(row("Context", status.config().context()))
+                .append(row("Namespace", status.config().namespace()))
+                .append(row("Authentication", "approle"))
+                .append(row("Role ID", status.config().roleId().isBlank() ? "missing" : "configured"))
+                .append(row("Secret ID", status.config().secretId().isBlank() ? "missing" : "configured"))
+                .append(row("Checked At", REPORT_DISPLAY_CLOCK.format(status.checkedAt())))
+                .append("</tbody></table>");
+        html.append("""
+                  </section>
+                </main>
+                </body>
+                </html>
+                """);
+        return html.toString();
+    }
+
+    private static String row(String name, String value) {
+        return "<tr><th>" + escapeHtml(name) + "</th><td>" + escapeHtml(value == null || value.isBlank() ? "not set" : value) + "</td></tr>";
+    }
+
     private List<StatusEntry> readStatusEntries() throws IOException {
         Path statusLog = appDir.resolve(STATUS_LOG_FILE).normalize();
         if (!Files.isRegularFile(statusLog)) {
@@ -1137,6 +1306,52 @@ public final class DnfUpdateApp {
     }
 
     private record PostRebootStatus(boolean machineUp, boolean serviceUp, Optional<String> workingHealthcheck) {
+    }
+
+    private record VaultConfig(
+            boolean enabled,
+            String uri,
+            String context,
+            String namespace,
+            String roleId,
+            String secretId
+    ) {
+        private static VaultConfig fromRuntime() {
+            return new VaultConfig(
+                    Boolean.parseBoolean(runtimeValue("VAULT_ENABLED", "spring.cloud.vault.enabled", "false")),
+                    runtimeValue("VAULT_URI", "spring.cloud.vault.uri", ""),
+                    runtimeValue("VAULT_CONTEXT", "spring.cloud.vault.kv.default-context", ""),
+                    runtimeValue("VAULT_NAMESPACE", "spring.cloud.vault.namespace", ""),
+                    runtimeValue("VAULT_ROLE_ID", "spring.cloud.vault.app-role.role-id", ""),
+                    runtimeValue("VAULT_SECRET_ID", "spring.cloud.vault.app-role.secret-id", "")
+            );
+        }
+
+        private static String runtimeValue(String envName, String propertyName, String fallback) {
+            String envValue = System.getenv(envName);
+            if (envValue != null && !envValue.isBlank()) {
+                return envValue.trim();
+            }
+            String propertyValue = System.getProperty(propertyName);
+            if (propertyValue != null && !propertyValue.isBlank()) {
+                return propertyValue.trim();
+            }
+            return fallback;
+        }
+    }
+
+    private record VaultStatus(String state, String message, VaultConfig config, Instant checkedAt) {
+        private static VaultStatus disabled(String message) {
+            return new VaultStatus("DISABLED", message, VaultConfig.fromRuntime(), Instant.now());
+        }
+
+        private static VaultStatus up(VaultConfig config, String message) {
+            return new VaultStatus("UP", message, config, Instant.now());
+        }
+
+        private static VaultStatus down(VaultConfig config, String message) {
+            return new VaultStatus("DOWN", message, config, Instant.now());
+        }
     }
 
     private enum ReportKind {
@@ -1441,7 +1656,7 @@ public final class DnfUpdateApp {
                         <h1>DNF Security Update Console</h1>
                         <div class="subtitle">Runs <code>dnf update --security</code> over SSH, streams progress, then reboots selected servers.</div>
                       </div>
-                      <div class="subtitle"><a href="/patching">Patch reports</a> · <a href="/dryrun">Dry run reports</a> · <a href="/status">Status</a> · Keys are loaded from the JAR folder</div>
+                      <div class="subtitle"><a href="/patching">Patch reports</a> · <a href="/dryrun">Dry run reports</a> · <a href="/status">Status</a> · <a href="/vault">Vault</a> · Keys are loaded from the JAR folder</div>
                     </div>
                   </header>
                   <main class="wrap">

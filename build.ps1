@@ -63,5 +63,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 Pop-Location
 
+$startScript = Join-Path $root "start.sh"
+if (Test-Path $startScript) {
+    Copy-Item -Force $startScript (Join-Path $dist "start.sh")
+    Write-Host "Copied start.sh to dist\start.sh"
+}
+
 Write-Host "Done."
 Write-Host "Run with: java -jar dist\dnf-security-update-console.jar"

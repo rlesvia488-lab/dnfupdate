@@ -26,15 +26,39 @@ Put the two PPK files next to the JAR, then run:
 java -jar dnf-security-update-console.jar
 ```
 
+On Linux servers, use the included launcher so Vault and JVM parameters are passed consistently:
+
+```bash
+chmod +x start.sh
+VAULT_URI="https://vault.example.com" VAULT_ROLE_ID="..." VAULT_SECRET_ID="..." ./start.sh
+```
+
 Open:
 
 ```text
 http://localhost:8080
 ```
 
+Vault connection status is available at:
+
+```text
+http://localhost:8080/vault
+```
+
 The app has 14 built-in authorized patch passphrases. The UI requires one valid passphrase before it will start any patching job.
 
 Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
+
+When started with `start.sh`, Vault AppRole settings are loaded from environment variables and matching JVM system properties:
+
+- `VAULT_ENABLED`
+- `VAULT_URI`
+- `VAULT_ROLE_ID`
+- `VAULT_SECRET_ID`
+- `VAULT_CONTEXT`
+- `VAULT_NAMESPACE`
+
+At startup the app connects to Vault with AppRole login and reports `UP`, `DOWN`, or `DISABLED` on `/vault`. Role ID and secret ID values are never shown in the UI.
 
 When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it reads the boot ID again. Service health checks only run if the boot ID changed, which confirms the OS completed a new boot. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
 
@@ -122,6 +146,7 @@ The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot comm
 - `/patching` report browser ordered by date
 - `/dryrun` dry run report browser ordered by date
 - `/status` post-reboot machine and service status ordered by date
+- `/vault` Vault AppRole connection status
 - Configurable SSH port, timeout, key filenames, and parallel server count
 
 # dnfupdate
