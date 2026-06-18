@@ -64,9 +64,6 @@ public final class DnfUpdateApp {
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
     private static final String STATUS_LOG_FILE = "status-checks.tsv";
     private static final String REPORT_DIR = "reports";
-    private static final String OAUTH_TOKEN_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-    private static final String OCS_SERVERS_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-    private static final String OCS_SERVER_ACTION_URL = "REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
     private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
     private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
@@ -672,13 +669,13 @@ public final class DnfUpdateApp {
             for (TechnicalAccount account : accounts) {
                 try {
                     job.add(host, "info", "Requesting CMAAS OAuth token for account " + account.accountId() + ".");
-                    String accessToken = requestCmaasToken(account);
-                    Optional<CloudServer> server = findCloudServer(host, accessToken);
+                    String accessToken = requestCmaasToken(account, config);
+                    Optional<CloudServer> server = findCloudServer(host, accessToken, config);
                     if (server.isEmpty()) {
                         job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host + " in OCS.");
                         continue;
                     }
-                    sendHardReboot(server.get(), accessToken);
+                    sendHardReboot(server.get(), accessToken, config);
                     job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
                             + " (" + server.get().name() + ") using account " + account.accountId() + ".");
                     return true;
@@ -793,7 +790,10 @@ public final class DnfUpdateApp {
         return "";
     }
 
-    private String requestCmaasToken(TechnicalAccount account) throws IOException, InterruptedException {
+    private String requestCmaasToken(TechnicalAccount account, VaultConfig config) throws IOException, InterruptedException {
+        if (config.oauthTokenUrl().isBlank()) {
+            throw new IOException("CMAAS_OAUTH_TOKEN_URL is not configured");
+        }
         String scope = account.accountId() + ":sgcp:cmaas:write_node "
                 + account.accountId() + ":sgcp:cmaas:read "
                 + account.accountId() + ":sgcp:lbaas:read "
@@ -802,7 +802,7 @@ public final class DnfUpdateApp {
                 + account.accountId() + ":sgcp:files:write";
         String body = "grant_type=client_credentials&scope=" + URLEncoder.encode(scope, StandardCharsets.UTF_8);
         String basic = Base64.getEncoder().encodeToString((account.clientId() + ":" + account.clientSecret()).getBytes(StandardCharsets.UTF_8));
-        HttpRequest request = HttpRequest.newBuilder(URI.create(OAUTH_TOKEN_URL))
+        HttpRequest request = HttpRequest.newBuilder(URI.create(config.oauthTokenUrl()))
                 .timeout(Duration.ofMillis(15000))
                 .header("Authorization", "Basic " + basic)
                 .header("Content-Type", "application/x-www-form-urlencoded")
@@ -820,11 +820,14 @@ public final class DnfUpdateApp {
         return token;
     }
 
-    private Optional<CloudServer> findCloudServer(String host, String accessToken) throws IOException, InterruptedException {
+    private Optional<CloudServer> findCloudServer(String host, String accessToken, VaultConfig config) throws IOException, InterruptedException {
+        if (config.ocsServersUrl().isBlank()) {
+            throw new IOException("OCS_SERVERS_URL is not configured");
+        }
         Exception lastFailure = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
-                HttpRequest request = HttpRequest.newBuilder(URI.create(OCS_SERVERS_URL))
+                HttpRequest request = HttpRequest.newBuilder(URI.create(config.ocsServersUrl()))
                         .timeout(Duration.ofMillis(15000))
                         .header("Content-Type", "application/json")
                         .header("Authorization", "Bearer " + accessToken)
@@ -875,9 +878,12 @@ public final class DnfUpdateApp {
         return Optional.empty();
     }
 
-    private void sendHardReboot(CloudServer server, String accessToken) throws IOException, InterruptedException {
+    private void sendHardReboot(CloudServer server, String accessToken, VaultConfig config) throws IOException, InterruptedException {
+        if (config.ocsServerActionUrl().isBlank()) {
+            throw new IOException("OCS_SERVER_ACTION_URL is not configured");
+        }
         String body = "{\"reboot\":{\"type\":\"HARD\"}}";
-        HttpRequest request = HttpRequest.newBuilder(URI.create(String.format(OCS_SERVER_ACTION_URL, urlPathEncode(server.id()))))
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverActionUrl(config.ocsServerActionUrl(), server.id())))
                 .timeout(Duration.ofMillis(15000))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + accessToken)
@@ -1319,6 +1325,9 @@ public final class DnfUpdateApp {
                 .append(row("Context", status.config().context()))
                 .append(row("Namespace", status.config().namespace()))
                 .append(row("Technical Accounts Path", status.config().technicalAccountsPath()))
+                .append(row("CMAAS OAuth Token URL", status.config().oauthTokenUrl().isBlank() ? "missing" : "configured"))
+                .append(row("OCS Servers URL", status.config().ocsServersUrl().isBlank() ? "missing" : "configured"))
+                .append(row("OCS Server Action URL", status.config().ocsServerActionUrl().isBlank() ? "missing" : "configured"))
                 .append(row("Authentication", "approle"))
                 .append(row("Role ID", status.config().roleId().isBlank() ? "missing" : "configured"))
                 .append(row("Secret ID", status.config().secretId().isBlank() ? "missing" : "configured"))
@@ -1527,6 +1536,17 @@ public final class DnfUpdateApp {
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
+    private static String serverActionUrl(String template, String serverId) {
+        String clean = template.trim();
+        if (clean.contains("%s")) {
+            return String.format(clean, urlPathEncode(serverId));
+        }
+        while (clean.endsWith("/")) {
+            clean = clean.substring(0, clean.length() - 1);
+        }
+        return clean + "/servers/" + urlPathEncode(serverId) + "/action";
+    }
+
     private static String escapeJson(String value) {
         StringBuilder builder = new StringBuilder(value.length() + 16);
         for (int i = 0; i < value.length(); i++) {
@@ -1618,6 +1638,9 @@ public final class DnfUpdateApp {
             String context,
             String namespace,
             String technicalAccountsPath,
+            String oauthTokenUrl,
+            String ocsServersUrl,
+            String ocsServerActionUrl,
             String roleId,
             String secretId
     ) {
@@ -1629,6 +1652,9 @@ public final class DnfUpdateApp {
                     runtimeValue("VAULT_NAMESPACE", "spring.cloud.vault.namespace", ""),
                     runtimeValue("VAULT_TECH_ACCOUNTS_PATH", "dnfupdate.vault.technical-accounts-path",
                             runtimeValue("VAULT_CONTEXT", "spring.cloud.vault.kv.default-context", "")),
+                    runtimeValue("CMAAS_OAUTH_TOKEN_URL", "dnfupdate.cmaas.oauth-token-url", ""),
+                    runtimeValue("OCS_SERVERS_URL", "dnfupdate.ocs.servers-url", ""),
+                    runtimeValue("OCS_SERVER_ACTION_URL", "dnfupdate.ocs.server-action-url", ""),
                     runtimeValue("VAULT_ROLE_ID", "spring.cloud.vault.app-role.role-id", ""),
                     runtimeValue("VAULT_SECRET_ID", "spring.cloud.vault.app-role.secret-id", "")
             );

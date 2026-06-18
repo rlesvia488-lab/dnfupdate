@@ -58,6 +58,9 @@ When started with `start.sh`, Vault AppRole settings are loaded from environment
 - `VAULT_CONTEXT`
 - `VAULT_NAMESPACE`
 - `VAULT_TECH_ACCOUNTS_PATH`
+- `CMAAS_OAUTH_TOKEN_URL`
+- `OCS_SERVERS_URL`
+- `OCS_SERVER_ACTION_URL`
 
 At startup the app connects to Vault with AppRole login and reports `UP`, `DOWN`, or `DISABLED` on `/vault`. Role ID and secret ID values are never shown in the UI.
 
@@ -75,9 +78,9 @@ When a server is not reachable over SSH after the normal reboot wait, the app:
 
 1. Reads all technical accounts from Vault.
 2. Requests a CMAAS OAuth token for each account.
-3. Calls `REDACTED_URL_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`.
+3. Calls the configured `OCS_SERVERS_URL`.
 4. Matches the input server by `accessIPv4` or server `name`.
-5. Calls `POST /servers/{server_id}/action` with `{"reboot":{"type":"HARD"}}`.
+5. Calls the configured `OCS_SERVER_ACTION_URL` with `{"reboot":{"type":"HARD"}}`.
 6. Checks SSH again every 10 seconds for up to 5 minutes.
 
 When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it reads the boot ID again. Service health checks only run if the boot ID changed, which confirms the OS completed a new boot. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
