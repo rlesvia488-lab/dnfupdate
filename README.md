@@ -36,7 +36,7 @@ The app has 14 built-in authorized patch passphrases. The UI requires one valid 
 
 Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
 
-When reboot is enabled, the app sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it runs local curl health checks on the server. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
+When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it reads the boot ID again. Service health checks only run if the boot ID changed, which confirms the OS completed a new boot. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
 
 Post-reboot machine and service status is stored in:
 

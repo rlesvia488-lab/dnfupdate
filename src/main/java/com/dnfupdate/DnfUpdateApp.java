@@ -415,12 +415,13 @@ public final class DnfUpdateApp {
             runRemote(job, host, session, "if command -v needs-restarting >/dev/null 2>&1; then sudo -n needs-restarting -r; else echo 'needs-restarting not installed; continuing'; fi", true);
             runRemote(job, host, session, "sync");
             if (job.settings.reboot) {
+                String bootIdBefore = readBootId(job, host, session);
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
                 job.add(host, "info", "After the reboot command is sent, the app will check SSH every 10 seconds for up to 5 minutes.");
                 runRemote(job, host, session, "sudo -n sh -c 'nohup sh -c \"sleep 2; systemctl reboot -i || reboot\" >/dev/null 2>&1 &'", true);
                 session.disconnect();
                 session = null;
-                PostRebootStatus status = verifyAfterReboot(job, host, report);
+                PostRebootStatus status = verifyAfterReboot(job, host, report, bootIdBefore);
                 try {
                     appendStatusLog(job, host, status);
                 } catch (IOException e) {
@@ -447,7 +448,19 @@ public final class DnfUpdateApp {
         }
     }
 
-    private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report) {
+    private String readBootId(Job job, String host, Session session) {
+        try {
+            RemoteResult result = runRemote(job, host, session, "cat /proc/sys/kernel/random/boot_id", true);
+            if (!result.lines().isEmpty()) {
+                return result.lines().get(result.lines().size() - 1).trim();
+            }
+        } catch (Exception e) {
+            job.add(host, "warn", "Unable to read Linux boot ID: " + cleanMessage(e));
+        }
+        return "";
+    }
+
+    private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report, String bootIdBefore) {
         Session verificationSession = null;
         long deadline = System.currentTimeMillis() + REBOOT_VERIFY_TIMEOUT_MILLIS;
         int attempt = 1;
@@ -480,6 +493,18 @@ public final class DnfUpdateApp {
         try {
             report.machineUpAfterReboot = true;
             job.add(host, "success", "Server is reachable over SSH after reboot.");
+
+            String bootIdAfter = readBootId(job, host, verificationSession);
+            if (!bootIdBefore.isBlank() && !bootIdAfter.isBlank()) {
+                if (bootIdBefore.equals(bootIdAfter)) {
+                    report.serviceUpAfterReboot = false;
+                    job.add(host, "error", "SSH is reachable, but Linux boot ID did not change. Reboot was not confirmed, so service checks were skipped.");
+                    return new PostRebootStatus(true, false, Optional.empty());
+                }
+                job.add(host, "success", "Reboot confirmed because Linux boot ID changed.");
+            } else {
+                job.add(host, "warn", "Linux boot ID could not be confirmed. Continuing with SSH reachability as the machine-up check.");
+            }
 
             for (String url : HEALTHCHECK_URLS) {
                 String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time 10 " + shellQuote(url);
