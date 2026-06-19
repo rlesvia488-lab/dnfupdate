@@ -661,6 +661,10 @@ public final class DnfUpdateApp {
                 job.add(host, "warn", "Linux boot ID could not be confirmed. Continuing with SSH reachability as the machine-up check.");
             }
 
+            job.add(host, "info", "Enabling and starting otelcol-contrib.service after reboot.");
+            runRemote(job, host, verificationSession, "sudo -n systemctl enable otelcol-contrib.service");
+            runRemote(job, host, verificationSession, "sudo -n systemctl start otelcol-contrib.service");
+
             for (String url : HEALTHCHECK_URLS) {
                 String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time 10 " + shellQuote(url);
                 RemoteResult result = runRemote(job, host, verificationSession, command, true);

@@ -133,7 +133,7 @@ When a server is not reachable over SSH after the normal reboot wait, the app:
 5. Calls the OCS server action URL fetched from Vault with `{"reboot":{"type":"HARD"}}`.
 6. Checks SSH again every 10 seconds for up to 5 minutes.
 
-When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it reads the boot ID again. Service health checks only run if the boot ID changed, which confirms the OS completed a new boot. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
+When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. As soon as the server is reachable, it reads the boot ID again. After confirming the reboot, it runs `sudo -n systemctl enable otelcol-contrib.service` and `sudo -n systemctl start otelcol-contrib.service`, then performs the configured service health checks. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
 
 Post-reboot machine and service status is stored in:
 
@@ -199,12 +199,13 @@ java -jar dnf-security-update-console.jar
 - Command: `sudo -n dnf -y update --security`
 - Pre-reboot cleanup: `sudo -n dnf -y remove --oldinstallonly`
 - Reboot: enabled by default
+- Post-reboot service commands: `sudo -n systemctl enable otelcol-contrib.service`, then `sudo -n systemctl start otelcol-contrib.service`
 - Audit log: `patch-audit.log`
 - Post-reboot status log: `status-checks.tsv`
 - HTML reports: `reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html`
 - Dry run reports: `reports\dryrun-report-YYYYMMDD-HHMMSS-<run-id>.html`
 
-The app expects `cloud-user` to have passwordless sudo for `dnf` cleanup/update and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
+The app expects `cloud-user` to have passwordless sudo for `dnf` cleanup/update, reboot, and the post-reboot `systemctl` commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
 
 ## UI Features
 
