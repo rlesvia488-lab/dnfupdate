@@ -124,6 +124,7 @@ public final class DnfUpdateApp {
         server.createContext("/reports", app::handleReportFile);
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
+        server.createContext("/api/technical-accounts", app::handleTechnicalAccounts);
         server.createContext("/api/job", app::handleJob);
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
@@ -344,6 +345,27 @@ public final class DnfUpdateApp {
             return;
         }
 
+        String technicalAccountName = form.getOrDefault("technicalAccount", "").trim();
+        if (technicalAccountName.isBlank()) {
+            send(exchange, 400, "application/json", "{\"error\":\"Select a Vault technical account.\"}");
+            return;
+        }
+        try {
+            CloudRecoveryConfig recoveryConfig = loadCloudRecoveryConfig(vaultStatus.config());
+            if (findTechnicalAccount(recoveryConfig, technicalAccountName).isEmpty()) {
+                send(exchange, 400, "application/json", "{\"error\":\"The selected Vault technical account is not available. Refresh the page and try again.\"}");
+                return;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            send(exchange, 503, "application/json", "{\"error\":\"Loading Vault technical accounts was interrupted.\"}");
+            return;
+        } catch (Exception e) {
+            send(exchange, 503, "application/json", "{\"error\":\"Unable to validate the Vault technical account: "
+                    + escapeJson(cleanMessage(e)) + "\"}");
+            return;
+        }
+
         Path key1 = appDir.resolve(blankDefault(form.get("key1"), "key1.ppk")).normalize();
         Path key2 = appDir.resolve(blankDefault(form.get("key2"), "key2.ppk")).normalize();
         if (!Files.isRegularFile(key1) && !Files.isRegularFile(key2)) {
@@ -362,11 +384,12 @@ public final class DnfUpdateApp {
                 "on".equals(form.get("reboot")),
                 "on".equals(form.get("makecache")),
                 "on".equals(form.get("skipBroken")),
-                "on".equals(form.get("dryRun"))
+                "on".equals(form.get("dryRun")),
+                technicalAccountName
         );
 
         Job job = new Job(UUID.randomUUID().toString(), hosts, settings, authorizedMember.get());
-        appendAuditLog(authorizedMember.get(), hosts);
+        appendAuditLog(authorizedMember.get(), hosts, technicalAccountName);
         jobs.put(job.id, job);
         jobPool.submit(() -> runJob(job));
         send(exchange, 200, "application/json", "{\"jobId\":\"" + escapeJson(job.id) + "\"}");
@@ -387,10 +410,41 @@ public final class DnfUpdateApp {
         return Optional.empty();
     }
 
-    private void appendAuditLog(String memberId, List<String> hosts) throws IOException {
-        String line = Instant.now() + " member=" + memberId + " servers=" + String.join(",", hosts) + System.lineSeparator();
+    private void appendAuditLog(String memberId, List<String> hosts, String technicalAccountName) throws IOException {
+        String line = Instant.now() + " member=" + memberId + " technicalAccount=" + technicalAccountName
+                + " servers=" + String.join(",", hosts) + System.lineSeparator();
         Files.writeString(appDir.resolve(AUDIT_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
                 java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+    }
+
+    private void handleTechnicalAccounts(HttpExchange exchange) throws IOException {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "application/json", "{\"error\":\"Method not allowed\"}");
+            return;
+        }
+        if (!"UP".equals(vaultStatus.state()) || vaultClientToken.isBlank()) {
+            send(exchange, 503, "application/json", "{\"error\":\"Vault is not connected.\"}");
+            return;
+        }
+        try {
+            CloudRecoveryConfig config = loadCloudRecoveryConfig(vaultStatus.config());
+            List<String> names = config.accounts().stream().map(TechnicalAccount::name).distinct().sorted(String.CASE_INSENSITIVE_ORDER).toList();
+            StringBuilder json = new StringBuilder("{\"accounts\":[");
+            for (int i = 0; i < names.size(); i++) {
+                if (i > 0) {
+                    json.append(',');
+                }
+                json.append('\"').append(escapeJson(names.get(i))).append('\"');
+            }
+            json.append("]}");
+            send(exchange, 200, "application/json", json.toString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            send(exchange, 503, "application/json", "{\"error\":\"Loading Vault technical accounts was interrupted.\"}");
+        } catch (Exception e) {
+            send(exchange, 503, "application/json", "{\"error\":\"Unable to load Vault technical accounts: "
+                    + escapeJson(cleanMessage(e)) + "\"}");
+        }
     }
 
     private void handleJob(HttpExchange exchange) throws IOException {
@@ -449,6 +503,7 @@ public final class DnfUpdateApp {
     private void runJob(Job job) {
         job.add("system", "info", "Started " + (job.settings.dryRun ? "dry run" : "patch job") + " for " + job.hosts.size() + " server(s).");
         job.add("system", "info", (job.settings.dryRun ? "Dry run" : "Patch") + " authorized by " + job.authorizedMember + " for servers: " + String.join(", ", job.hosts));
+        job.add("system", "info", "Selected Vault technical account: " + job.settings.technicalAccountName + ".");
         Semaphore semaphore = new Semaphore(job.settings.concurrency);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
@@ -670,37 +725,38 @@ public final class DnfUpdateApp {
                 job.add(host, "error", "Cloud API URLs are missing from Vault secret " + config.technicalAccountsPath() + ".");
                 return false;
             }
-            job.add(host, "info", "Trying hard reboot API recovery with " + recoveryConfig.accounts().size() + " technical account(s) from Vault.");
-            for (TechnicalAccount account : recoveryConfig.accounts()) {
+            Optional<TechnicalAccount> selected = findTechnicalAccount(recoveryConfig, job.settings.technicalAccountName);
+            if (selected.isEmpty()) {
+                job.add(host, "error", "Selected technical account " + job.settings.technicalAccountName + " was not found in Vault.");
+                return false;
+            }
+            TechnicalAccount account = selected.get();
+            job.add(host, "info", "Using selected Vault technical account " + account.name() + " for hard reboot recovery.");
+            String accessToken = requestCmaasToken(account, recoveryConfig);
+            for (OcsEndpoint endpoint : recoveryConfig.ocsEndpoints()) {
                 try {
-                    job.add(host, "info", "Requesting CMAAS OAuth token for account " + account.accountId() + ".");
-                    String accessToken = requestCmaasToken(account, recoveryConfig);
-                    for (OcsEndpoint endpoint : recoveryConfig.ocsEndpoints()) {
-                        try {
-                            Optional<CloudServer> server = findCloudServer(host, accessToken, endpoint);
-                            if (server.isEmpty()) {
-                                job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host
-                                        + " in OCS endpoint " + endpoint.name() + ".");
-                                continue;
-                            }
-                            sendHardReboot(server.get(), accessToken, endpoint);
-                            job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
-                                    + " (" + server.get().name() + ") using account " + account.accountId()
-                                    + " via " + endpoint.name() + ".");
-                            return true;
-                        } catch (Exception e) {
-                            job.add(host, "warn", "OCS endpoint " + endpoint.name() + " failed for account "
-                                    + account.accountId() + ": " + cleanMessage(e));
-                        }
+                    Optional<CloudServer> server = findCloudServer(host, accessToken, endpoint);
+                    if (server.isEmpty()) {
+                        job.add(host, "warn", "Server " + host + " was not found in OCS endpoint " + endpoint.name() + ".");
+                        continue;
                     }
+                    sendHardReboot(server.get(), accessToken, endpoint);
+                    job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
+                            + " (" + server.get().name() + ") using " + account.name() + " via " + endpoint.name() + ".");
+                    return true;
                 } catch (Exception e) {
-                    job.add(host, "warn", "Hard reboot attempt with account " + account.accountId() + " failed: " + cleanMessage(e));
+                    job.add(host, "warn", "OCS endpoint " + endpoint.name() + " failed using "
+                            + account.name() + ": " + cleanMessage(e));
                 }
             }
         } catch (Exception e) {
             job.add(host, "error", "Unable to run hard reboot API recovery: " + cleanMessage(e));
         }
         return false;
+    }
+
+    private static Optional<TechnicalAccount> findTechnicalAccount(CloudRecoveryConfig config, String name) {
+        return config.accounts().stream().filter(account -> account.name().equals(name)).findFirst();
     }
 
     private CloudRecoveryConfig loadCloudRecoveryConfig(VaultConfig config) throws IOException, InterruptedException {
@@ -726,7 +782,7 @@ public final class DnfUpdateApp {
                 Object parsed = new JsonParser(response.body()).parse();
                 Object data = vaultDataPayload(parsed);
                 List<TechnicalAccount> accounts = new ArrayList<>();
-                collectTechnicalAccounts(data, accounts, new HashSet<>());
+                collectTechnicalAccounts(data, "", accounts, new HashSet<>());
                 List<OcsEndpoint> ocsEndpoints = new ArrayList<>();
                 collectOcsEndpoints(data, ocsEndpoints, new HashSet<>());
                 return new CloudRecoveryConfig(
@@ -779,7 +835,7 @@ public final class DnfUpdateApp {
     }
 
     @SuppressWarnings("unchecked")
-    private static void collectTechnicalAccounts(Object value, List<TechnicalAccount> accounts, Set<String> seen) {
+    private static void collectTechnicalAccounts(Object value, String suggestedName, List<TechnicalAccount> accounts, Set<String> seen) {
         if (value instanceof Map<?, ?> map) {
             String accountId = firstNonBlank(map, "account_id", "accountId", "account-id");
             String clientId = firstNonBlank(map, "client_id", "clientId", "client-id");
@@ -787,17 +843,25 @@ public final class DnfUpdateApp {
             if (!accountId.isBlank() && !clientId.isBlank() && !clientSecret.isBlank()) {
                 String key = accountId + "\n" + clientId;
                 if (seen.add(key)) {
-                    accounts.add(new TechnicalAccount(accountId, clientId, clientSecret));
+                    String explicitName = firstNonBlank(map, "name", "label", "trigram", "technical_account_name");
+                    String name = !explicitName.isBlank() ? explicitName
+                            : isAccountContainerName(suggestedName) || suggestedName.isBlank() ? accountId : suggestedName;
+                    accounts.add(new TechnicalAccount(name, accountId, clientId, clientSecret));
                 }
             }
-            for (Object nested : map.values()) {
-                collectTechnicalAccounts(nested, accounts, seen);
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                collectTechnicalAccounts(entry.getValue(), stringValue(entry.getKey()), accounts, seen);
             }
         } else if (value instanceof Collection<?> collection) {
             for (Object nested : collection) {
-                collectTechnicalAccounts(nested, accounts, seen);
+                collectTechnicalAccounts(nested, suggestedName, accounts, seen);
             }
         }
+    }
+
+    private static boolean isAccountContainerName(String name) {
+        return "accounts".equalsIgnoreCase(name) || "technical_accounts".equalsIgnoreCase(name)
+                || "technicalAccounts".equalsIgnoreCase(name);
     }
 
     private static void collectOcsEndpoints(Object value, List<OcsEndpoint> endpoints, Set<String> seen) {
@@ -1126,6 +1190,7 @@ public final class DnfUpdateApp {
                 .append("<div><b>Run type:</b> ").append(job.settings.dryRun ? "Dry run" : "Patch").append("</div>")
                 .append("<div><b>Started:</b> ").append(escapeHtml(REPORT_DISPLAY_CLOCK.format(job.startedAt))).append("</div>")
                 .append("<div><b>Authorized member:</b> ").append(escapeHtml(job.authorizedMember)).append("</div>")
+                .append("<div><b>Vault technical account:</b> ").append(escapeHtml(job.settings.technicalAccountName)).append("</div>")
                 .append("<div><b>Command:</b> ")
                 .append(job.settings.dryRun ? "dry run only; no update command executed" : "sudo -n dnf -y update --security")
                 .append(!job.settings.dryRun && job.settings.skipBroken ? " --skip-broken" : "")
@@ -1653,7 +1718,8 @@ public final class DnfUpdateApp {
             boolean reboot,
             boolean makecache,
             boolean skipBroken,
-            boolean dryRun
+            boolean dryRun,
+            String technicalAccountName
     ) {
     }
 
@@ -1682,7 +1748,7 @@ public final class DnfUpdateApp {
     private record SshWaitResult(Session session, Exception lastFailure) {
     }
 
-    private record TechnicalAccount(String accountId, String clientId, String clientSecret) {
+    private record TechnicalAccount(String name, String accountId, String clientId, String clientSecret) {
     }
 
     private record CloudServer(String id, String name, String accessIPv4) {
@@ -2106,7 +2172,7 @@ public final class DnfUpdateApp {
                       font-weight: 700;
                       margin-bottom: 6px;
                     }
-                    input, textarea {
+                    input, textarea, select {
                       width: 100%;
                       border: 1px solid #cbd5e1;
                       border-radius: 6px;
@@ -2241,6 +2307,13 @@ public final class DnfUpdateApp {
                           <div class="muted">Required before any server patching starts.</div>
                         </div>
                         <div class="field">
+                          <label for="technicalAccount">Vault technical account</label>
+                          <select id="technicalAccount" name="technicalAccount" required disabled>
+                            <option value="">Loading accounts from Vault...</option>
+                          </select>
+                          <div id="technicalAccountHelp" class="muted">Select the account group that owns these servers.</div>
+                        </div>
+                        <div class="field">
                           <label for="hosts">Servers</label>
                           <textarea id="hosts" name="hosts" placeholder="10.0.1.10&#10;10.0.1.11"></textarea>
                           <div class="muted">One IP or hostname per line. Lines starting with # are ignored.</div>
@@ -2298,6 +2371,8 @@ public final class DnfUpdateApp {
                     const logs = document.getElementById('logs');
                     const runButton = document.getElementById('runButton');
                     const dryRun = document.getElementById('dryRun');
+                    const technicalAccount = document.getElementById('technicalAccount');
+                    const technicalAccountHelp = document.getElementById('technicalAccountHelp');
                     const hostsView = document.getElementById('hostsView');
                     const counts = {
                       total: document.getElementById('total'),
@@ -2306,6 +2381,30 @@ public final class DnfUpdateApp {
                       failed: document.getElementById('failed')
                     };
                     let source = null;
+
+                    async function loadTechnicalAccounts() {
+                      try {
+                        const response = await fetch('/api/technical-accounts');
+                        const data = await response.json();
+                        if (!response.ok) throw new Error(data.error || 'Unable to load accounts.');
+                        technicalAccount.innerHTML = '<option value="">Select an account</option>';
+                        (data.accounts || []).forEach(name => {
+                          const option = document.createElement('option');
+                          option.value = name;
+                          option.textContent = name;
+                          technicalAccount.appendChild(option);
+                        });
+                        technicalAccount.disabled = false;
+                        if (!data.accounts || data.accounts.length === 0) {
+                          technicalAccountHelp.textContent = 'No named technical accounts were found in Vault.';
+                        }
+                      } catch (error) {
+                        technicalAccount.innerHTML = '<option value="">Vault accounts unavailable</option>';
+                        technicalAccountHelp.textContent = error.message;
+                      }
+                    }
+
+                    loadTechnicalAccounts();
 
                     dryRun.addEventListener('change', () => {
                       runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';

@@ -73,13 +73,17 @@ For hard reboot recovery, store one or more technical accounts in the Vault secr
       "ocs_server_action_url": "ocs-server-action-url-or-template-with-%s"
     }
   ],
-  "account_id": "account-id",
-  "client_id": "oauth-client-id",
-  "client_secret": "oauth-client-secret"
+  "technical_accounts": {
+    "TRIG-DEV": {
+      "account_id": "account-id",
+      "client_id": "oauth-client-id",
+      "client_secret": "oauth-client-secret"
+    }
+  }
 }
 ```
 
-The URL fields can be at the top level of the secret or nested anywhere inside it. Technical account objects can also be nested and repeated.
+The URL fields can be at the top level of the secret or nested anywhere inside it. Each key under `technical_accounts`, such as `TRIG-DEV`, becomes the account name displayed in the UI. An account object may alternatively provide an explicit `name` field.
 
 For example, one Vault secret can contain shared cloud API URLs and multiple technical accounts:
 
@@ -98,32 +102,32 @@ For example, one Vault secret can contain shared cloud API URLs and multiple tec
       "ocs_server_action_url": "https://ocs-north.example.com/v1/servers/%s/action"
     }
   ],
-  "technical_accounts": [
-    {
-      "account_id": "technical-account-01",
-      "client_id": "oauth-client-id-01",
-      "client_secret": "replace-with-client-secret-01"
+  "technical_accounts": {
+    "TRIG-DEV": {
+      "account_id": "technical-account-dev",
+      "client_id": "oauth-client-id-dev",
+      "client_secret": "replace-with-client-secret-dev"
     },
-    {
-      "account_id": "technical-account-02",
-      "client_id": "oauth-client-id-02",
-      "client_secret": "replace-with-client-secret-02"
+    "TRIG-INT": {
+      "account_id": "technical-account-int",
+      "client_id": "oauth-client-id-int",
+      "client_secret": "replace-with-client-secret-int"
     },
-    {
-      "account_id": "technical-account-03",
-      "client_id": "oauth-client-id-03",
-      "client_secret": "replace-with-client-secret-03"
+    "TRIG-PROD": {
+      "account_id": "technical-account-prod",
+      "client_id": "oauth-client-id-prod",
+      "client_secret": "replace-with-client-secret-prod"
     }
-  ]
+  }
 }
 ```
 
-Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. During hard reboot recovery, the app tries the accounts and the Paris/North OCS endpoints in their stored order until it successfully finds and reboots the target server. A legacy secret containing one top-level OCS URL pair remains supported.
+Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. Before starting a job, select the account name that owns the submitted servers. During hard reboot recovery, the app uses only that selected account and searches the Paris and North OCS endpoints in their stored order. A legacy secret containing one top-level OCS URL pair remains supported.
 
 When a server is not reachable over SSH after the normal reboot wait, the app:
 
-1. Reads all technical accounts from Vault.
-2. Requests a CMAAS OAuth token for each account.
+1. Loads the technical account selected for the patch job.
+2. Requests a CMAAS OAuth token for that account only.
 3. Calls each Paris/North OCS servers URL fetched from Vault.
 4. Matches the input server by `accessIPv4` or server `name`.
 5. Calls the OCS server action URL fetched from Vault with `{"reboot":{"type":"HARD"}}`.
