@@ -76,6 +76,35 @@ For hard reboot recovery, store one or more technical accounts in the Vault secr
 
 The URL fields can be at the top level of the secret or nested anywhere inside it. Technical account objects can also be nested and repeated.
 
+For example, one Vault secret can contain shared cloud API URLs and multiple technical accounts:
+
+```json
+{
+  "cmaas_oauth_token_url": "https://cmaas.example.com/oauth/token",
+  "ocs_servers_url": "https://ocs.example.com/v1/servers",
+  "ocs_server_action_url": "https://ocs.example.com/v1/servers/%s/action",
+  "technical_accounts": [
+    {
+      "account_id": "technical-account-01",
+      "client_id": "oauth-client-id-01",
+      "client_secret": "replace-with-client-secret-01"
+    },
+    {
+      "account_id": "technical-account-02",
+      "client_id": "oauth-client-id-02",
+      "client_secret": "replace-with-client-secret-02"
+    },
+    {
+      "account_id": "technical-account-03",
+      "client_id": "oauth-client-id-03",
+      "client_secret": "replace-with-client-secret-03"
+    }
+  ]
+}
+```
+
+Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. During hard reboot recovery, the app tries the accounts in their stored order until it successfully finds and reboots the target server.
+
 When a server is not reachable over SSH after the normal reboot wait, the app:
 
 1. Reads all technical accounts from Vault.
