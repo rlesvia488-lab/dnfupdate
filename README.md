@@ -49,7 +49,7 @@ The app has 14 built-in authorized patch passphrases. The UI requires one valid 
 
 Every accepted patch launch is logged to `patch-audit.log` beside the JAR with the authorized member slot and target server list. The app stores only SHA-256 hashes of the passphrases in the JAR.
 
-Detailed diagnostics are appended to `dnf-update-debug.log` beside the JAR. This file contains every job event, SSH command and output, API method and URL, HTTP status, and response body. Authorization headers, Vault credentials, client secrets, and OAuth token values are redacted; token length and a short SHA-256 fingerprint are recorded so a token can be correlated safely without exposing it. Protect this log because API response bodies and server output can still contain operationally sensitive data.
+Detailed diagnostics are appended to `dnf-update-debug.log` beside the JAR. This file contains every job event, SSH command and output, API method and URL, HTTP status, and response body. Authorization headers, Vault credentials, client secrets, and OAuth token values are redacted; token length and a short SHA-256 fingerprint are recorded so a token can be correlated safely without exposing it. Protect this log because API response bodies and server output can still contain operationally sensitive data. The log rotates at 50 MB and retains five backups named `dnf-update-debug.log.1` through `.5`.
 
 When started with `start.sh`, Vault AppRole settings are loaded from environment variables and matching JVM system properties:
 
@@ -61,7 +61,7 @@ When started with `start.sh`, Vault AppRole settings are loaded from environment
 - `VAULT_NAMESPACE`
 - `VAULT_TECH_ACCOUNTS_PATH`
 
-At startup the app connects to Vault with AppRole login and reports `UP`, `DOWN`, or `DISABLED` on `/vault`. Role ID and secret ID values are never shown in the UI.
+At startup the app connects to Vault with AppRole login and reports `UP`, `DOWN`, or `DISABLED` on `/vault`. Role ID and secret ID values are never shown in the UI. The app reads the token lease duration, refreshes the AppRole token shortly before expiry, and performs one forced re-login and retry if a Vault secret request returns HTTP 401 or 403. This keeps hard-reboot recovery working after long patch and reboot waits.
 
 For hard reboot recovery, store one or more technical accounts in the Vault secret referenced by `VAULT_TECH_ACCOUNTS_PATH` or, by default, `VAULT_CONTEXT`. The app searches the secret recursively for objects containing:
 
@@ -125,6 +125,8 @@ For example, one Vault secret can contain shared cloud API URLs and multiple tec
 ```
 
 Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. Before starting a job, select the account name that owns the submitted servers. During hard reboot recovery, the app uses only that selected account and searches the Paris and North OCS endpoints in their stored order. A legacy secret containing one top-level OCS URL pair remains supported.
+
+The recommended `ocs_server_action_url` format is the full template `https://ocs.example.com/v0/servers/%s/action`, where `%s` is replaced with the URL-encoded OCS server ID. A value ending in `/servers`, such as `https://ocs.example.com/v0/servers`, is also supported and becomes `/servers/<server-id>/action`. If only an API base such as `https://ocs.example.com/v0` is supplied, the app appends `/servers/<server-id>/action`.
 
 When a server is not reachable over SSH after the normal reboot wait, the app:
 

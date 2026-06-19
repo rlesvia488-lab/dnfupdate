@@ -25,6 +25,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -68,9 +69,12 @@ public final class DnfUpdateApp {
     private static final String REPORT_DIR = "reports";
     private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
     private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
+    private static final long COMPLETED_JOB_RETENTION_SECONDS = 24 * 60 * 60;
+    private static final long DEBUG_LOG_MAX_BYTES = 50L * 1024 * 1024;
+    private static final int DEBUG_LOG_BACKUPS = 5;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
     private static final Pattern SENSITIVE_JSON_PATTERN = Pattern.compile(
-            "(?i)(\\\"(?:access_token|refresh_token|client_token|client_secret|clientSecret|secret_id|secretId|role_id|roleId|password|token)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")");
+            "(?i)(\\\"(?:access_token|refresh_token|client_token|client_secret|client-secret|clientSecret|secret_id|secret-id|secretId|role_id|role-id|roleId|accessor|password|token)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")");
     private static final Pattern AUTHORIZATION_PATTERN = Pattern.compile(
             "(?i)(Authorization\\s*[:=]\\s*(?:Bearer|Basic)\\s+)[^\\s,;]+"
     );
@@ -106,11 +110,14 @@ public final class DnfUpdateApp {
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(ZoneId.systemDefault());
 
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
-    private final ExecutorService jobPool = Executors.newCachedThreadPool();
+    private final Set<String> activeHosts = ConcurrentHashMap.newKeySet();
+    private final ExecutorService jobPool = Executors.newFixedThreadPool(20);
     private final Object debugLogLock = new Object();
+    private final Object vaultAuthLock = new Object();
     private final Path appDir;
     private volatile VaultStatus vaultStatus = VaultStatus.disabled("Vault is disabled.");
     private volatile String vaultClientToken = "";
+    private volatile Instant vaultTokenRefreshAt = Instant.EPOCH;
 
     private DnfUpdateApp(Path appDir) {
         this.appDir = appDir;
@@ -170,6 +177,36 @@ public final class DnfUpdateApp {
             return;
         }
 
+        authenticateVault(config, true);
+    }
+
+    private boolean ensureVaultToken(VaultConfig config) {
+        if (!vaultClientToken.isBlank() && Instant.now().isBefore(vaultTokenRefreshAt)) {
+            return true;
+        }
+        return authenticateVault(config, false);
+    }
+
+    private boolean refreshRejectedVaultToken(VaultConfig config, String rejectedToken) {
+        synchronized (vaultAuthLock) {
+            if (!vaultClientToken.isBlank() && !vaultClientToken.equals(rejectedToken)
+                    && Instant.now().isBefore(vaultTokenRefreshAt)) {
+                return true;
+            }
+            return authenticateVaultLocked(config, false);
+        }
+    }
+
+    private boolean authenticateVault(VaultConfig config, boolean startup) {
+        synchronized (vaultAuthLock) {
+            if (!startup && !vaultClientToken.isBlank() && Instant.now().isBefore(vaultTokenRefreshAt)) {
+                return true;
+            }
+            return authenticateVaultLocked(config, startup);
+        }
+    }
+
+    private boolean authenticateVaultLocked(VaultConfig config, boolean startup) {
         try {
             URI loginUri = URI.create(stripTrailingSlash(config.uri()) + "/v1/auth/approle/login");
             String body = "{\"role_id\":\"" + escapeJson(config.roleId()) + "\",\"secret_id\":\"" + escapeJson(config.secretId()) + "\"}";
@@ -191,17 +228,27 @@ public final class DnfUpdateApp {
             Optional<String> token = extractJsonString(response.body(), "client_token");
             if (response.statusCode() >= 200 && response.statusCode() < 300 && token.isPresent()) {
                 vaultClientToken = token.get();
+                long leaseSeconds = extractJsonLong(response.body(), "lease_duration").orElse(0L);
+                vaultTokenRefreshAt = leaseSeconds > 0
+                        ? Instant.now().plusSeconds(Math.max(1L, leaseSeconds - Math.min(30L, leaseSeconds / 5L)))
+                        : Instant.MAX;
                 appendDebugLog("TOKEN", "Vault client token received length=" + vaultClientToken.length()
-                        + " sha256-prefix=" + sha256Hex(vaultClientToken).substring(0, 12) + " value=[REDACTED]");
-                vaultStatus = VaultStatus.up(config, "Connected to Vault with AppRole. Token was received and kept only in memory for the login check.");
+                        + " sha256-prefix=" + sha256Hex(vaultClientToken).substring(0, 12) + " leaseSeconds=" + leaseSeconds
+                        + " refreshAt=" + vaultTokenRefreshAt + " value=[REDACTED]");
+                vaultStatus = VaultStatus.up(config, "Connected to Vault with AppRole. Token refresh is automatic.");
+                return true;
             } else {
                 vaultClientToken = "";
+                vaultTokenRefreshAt = Instant.EPOCH;
                 vaultStatus = VaultStatus.down(config, "Vault AppRole login failed with HTTP " + response.statusCode() + ".");
+                return false;
             }
         } catch (Exception e) {
             appendDebugLog("HTTP ERROR", "Vault AppRole login failed: " + cleanMessage(e));
             vaultClientToken = "";
+            vaultTokenRefreshAt = Instant.EPOCH;
             vaultStatus = VaultStatus.down(config, "Vault connection failed: " + cleanMessage(e));
+            return false;
         }
     }
 
@@ -223,6 +270,23 @@ public final class DnfUpdateApp {
             return Optional.empty();
         }
         return Optional.of(unescapeJsonString(matcher.group(1)));
+    }
+
+    private static Optional<Long> extractJsonLong(String json, String key) {
+        if (json == null || json.isBlank()) {
+            return Optional.empty();
+        }
+        Pattern pattern = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\d+)");
+        Matcher matcher = pattern.matcher(json);
+        try {
+            Long lastValue = null;
+            while (matcher.find()) {
+                lastValue = Long.parseLong(matcher.group(1));
+            }
+            return Optional.ofNullable(lastValue);
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
     }
 
     private static String unescapeJsonString(String value) {
@@ -385,6 +449,10 @@ public final class DnfUpdateApp {
 
         Path key1 = appDir.resolve(blankDefault(form.get("key1"), "key1.ppk")).normalize();
         Path key2 = appDir.resolve(blankDefault(form.get("key2"), "key2.ppk")).normalize();
+        if (!key1.startsWith(appDir) || !key2.startsWith(appDir)) {
+            send(exchange, 400, "application/json", "{\"error\":\"SSH key files must be located beside the JAR or in one of its subdirectories.\"}");
+            return;
+        }
         if (!Files.isRegularFile(key1) && !Files.isRegularFile(key2)) {
             send(exchange, 400, "application/json",
                     "{\"error\":\"Neither key file was found next to the JAR. Expected key1.ppk or key2.ppk by default.\"}");
@@ -407,7 +475,17 @@ public final class DnfUpdateApp {
 
         String jobId = UUID.randomUUID().toString();
         Job job = new Job(jobId, hosts, settings, authorizedMember.get(), event -> appendDebugEvent(jobId, event));
-        appendAuditLog(authorizedMember.get(), hosts, technicalAccountName);
+        try {
+            appendAuditLog(authorizedMember.get(), hosts, technicalAccountName);
+        } catch (IOException e) {
+            appendDebugLog("AUDIT ERROR", "Unable to append patch audit log: " + cleanMessage(e));
+            send(exchange, 500, "application/json", "{\"error\":\"Unable to write patch audit log: "
+                    + escapeJson(cleanMessage(e)) + "\"}");
+            return;
+        }
+        Instant completedJobCutoff = Instant.now().minusSeconds(COMPLETED_JOB_RETENTION_SECONDS);
+        jobs.entrySet().removeIf(entry -> entry.getValue().finished.get()
+                && entry.getValue().startedAt.isBefore(completedJobCutoff));
         jobs.put(job.id, job);
         jobPool.submit(() -> runJob(job));
         send(exchange, 200, "application/json", "{\"jobId\":\"" + escapeJson(job.id) + "\"}");
@@ -447,12 +525,28 @@ public final class DnfUpdateApp {
         String line = Instant.now() + " [" + category + "] " + safeMessage + System.lineSeparator();
         synchronized (debugLogLock) {
             try {
-                Files.writeString(appDir.resolve(DEBUG_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
+                Path debugLog = appDir.resolve(DEBUG_LOG_FILE).normalize();
+                rotateDebugLogIfNeeded(debugLog);
+                Files.writeString(debugLog, line, StandardCharsets.UTF_8,
                         java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
             } catch (IOException e) {
                 System.err.println("Unable to write debug log: " + e.getMessage());
             }
         }
+    }
+
+    private void rotateDebugLogIfNeeded(Path debugLog) throws IOException {
+        if (!Files.isRegularFile(debugLog) || Files.size(debugLog) < DEBUG_LOG_MAX_BYTES) {
+            return;
+        }
+        for (int index = DEBUG_LOG_BACKUPS - 1; index >= 1; index--) {
+            Path source = debugLog.resolveSibling(DEBUG_LOG_FILE + "." + index);
+            if (Files.isRegularFile(source)) {
+                Files.move(source, debugLog.resolveSibling(DEBUG_LOG_FILE + "." + (index + 1)),
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        Files.move(debugLog, debugLog.resolveSibling(DEBUG_LOG_FILE + ".1"), StandardCopyOption.REPLACE_EXISTING);
     }
 
     private static String redactSensitive(String value) {
@@ -465,12 +559,13 @@ public final class DnfUpdateApp {
             send(exchange, 405, "application/json", "{\"error\":\"Method not allowed\"}");
             return;
         }
-        if (!"UP".equals(vaultStatus.state()) || vaultClientToken.isBlank()) {
-            send(exchange, 503, "application/json", "{\"error\":\"Vault is not connected.\"}");
+        VaultConfig vaultConfig = vaultStatus.config();
+        if (!vaultConfig.enabled() || vaultConfig.uri().isBlank() || vaultConfig.roleId().isBlank() || vaultConfig.secretId().isBlank()) {
+            send(exchange, 503, "application/json", "{\"error\":\"Vault AppRole configuration is incomplete.\"}");
             return;
         }
         try {
-            CloudRecoveryConfig config = loadCloudRecoveryConfig(vaultStatus.config());
+            CloudRecoveryConfig config = loadCloudRecoveryConfig(vaultConfig);
             List<String> names = config.accounts().stream().map(TechnicalAccount::name).distinct().sorted(String.CASE_INSENSITIVE_ORDER).toList();
             StringBuilder json = new StringBuilder("{\"accounts\":[");
             for (int i = 0; i < names.size(); i++) {
@@ -553,14 +648,23 @@ public final class DnfUpdateApp {
         for (String host : job.hosts) {
             futures.add(CompletableFuture.runAsync(() -> {
                 boolean acquired = false;
+                boolean hostClaimed = false;
                 try {
                     semaphore.acquire();
                     acquired = true;
+                    hostClaimed = activeHosts.add(host.toLowerCase(Locale.ROOT));
+                    if (!hostClaimed) {
+                        job.fail(host, "Another active job is already processing this host.");
+                        return;
+                    }
                     updateOneHost(job, host);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     job.fail(host, "Interrupted before starting.");
                 } finally {
+                    if (hostClaimed) {
+                        activeHosts.remove(host.toLowerCase(Locale.ROOT));
+                    }
                     if (acquired) {
                         semaphore.release();
                     }
@@ -575,9 +679,9 @@ public final class DnfUpdateApp {
         } catch (IOException e) {
             job.add("system", "error", "Unable to generate HTML report: " + e.getMessage());
         }
-        job.finished.set(true);
         job.add("system", job.failed.get() == 0 ? "success" : "error",
                 "Finished. Success: " + job.succeeded.get() + ", failed: " + job.failed.get() + ".");
+        job.finished.set(true);
     }
 
     private void updateOneHost(Job job, String host) {
@@ -780,8 +884,8 @@ public final class DnfUpdateApp {
 
     private boolean forceHardRebootWithCloudApi(Job job, String host) {
         VaultConfig config = vaultStatus.config();
-        if (!"UP".equals(vaultStatus.state()) || vaultClientToken.isBlank()) {
-            job.add(host, "error", "Cannot call hard reboot API because Vault is not connected.");
+        if (!config.enabled() || config.uri().isBlank() || config.roleId().isBlank() || config.secretId().isBlank()) {
+            job.add(host, "error", "Cannot call hard reboot API because Vault AppRole configuration is incomplete.");
             return false;
         }
         try {
@@ -829,42 +933,59 @@ public final class DnfUpdateApp {
     }
 
     private CloudRecoveryConfig loadCloudRecoveryConfig(VaultConfig config) throws IOException, InterruptedException {
+        if (!ensureVaultToken(config)) {
+            throw new IOException("Vault AppRole login failed while refreshing the client token");
+        }
         List<String> candidatePaths = vaultSecretPaths(config.technicalAccountsPath());
         Exception lastFailure = null;
         for (String path : candidatePaths) {
-            try {
-                URI uri = URI.create(stripTrailingSlash(config.uri()) + path);
-                appendDebugLog("HTTP REQUEST", "GET " + uri + " headers={X-Vault-Token=[REDACTED], X-Vault-Namespace="
-                        + (config.namespace().isBlank() ? "<none>" : config.namespace()) + "}");
-                HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(uri)
-                        .timeout(Duration.ofMillis(15000))
-                        .header("X-Vault-Token", vaultClientToken)
-                        .GET();
-                if (!config.namespace().isBlank()) {
-                    requestBuilder.header("X-Vault-Namespace", config.namespace());
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    URI uri = URI.create(stripTrailingSlash(config.uri()) + path);
+                    String tokenUsed = vaultClientToken;
+                    appendDebugLog("HTTP REQUEST", "GET " + uri + " attempt=" + attempt
+                            + " headers={X-Vault-Token=[REDACTED], X-Vault-Namespace="
+                            + (config.namespace().isBlank() ? "<none>" : config.namespace()) + "}");
+                    HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(uri)
+                            .timeout(Duration.ofMillis(15000))
+                            .header("X-Vault-Token", tokenUsed)
+                            .GET();
+                    if (!config.namespace().isBlank()) {
+                        requestBuilder.header("X-Vault-Namespace", config.namespace());
+                    }
+                    HttpResponse<String> response = httpClient().send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                    appendDebugLog("HTTP RESPONSE", "GET " + uri + " attempt=" + attempt + " status="
+                            + response.statusCode() + " body=" + response.body());
+                    if ((response.statusCode() == 401 || response.statusCode() == 403) && attempt == 1) {
+                        appendDebugLog("VAULT", "Vault rejected the client token with HTTP " + response.statusCode()
+                                + "; performing AppRole login and retrying once.");
+                        if (refreshRejectedVaultToken(config, tokenUsed)) {
+                            continue;
+                        }
+                    }
+                    if (response.statusCode() == 404) {
+                        break;
+                    }
+                    if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                        throw new IOException("Vault secret read failed with HTTP " + response.statusCode());
+                    }
+                    Object parsed = new JsonParser(response.body()).parse();
+                    Object data = vaultDataPayload(parsed);
+                    List<TechnicalAccount> accounts = new ArrayList<>();
+                    collectTechnicalAccounts(data, "", accounts, new HashSet<>());
+                    List<OcsEndpoint> ocsEndpoints = new ArrayList<>();
+                    collectOcsEndpoints(data, ocsEndpoints, new HashSet<>());
+                    return new CloudRecoveryConfig(
+                            accounts,
+                            findFirstString(data, "cmaas_oauth_token_url", "cmaasOauthTokenUrl", "oauth_token_url", "oauthTokenUrl"),
+                            ocsEndpoints
+                    );
+                } catch (Exception e) {
+                    lastFailure = e;
+                    appendDebugLog("HTTP ERROR", "Vault secret request path=" + path + " attempt=" + attempt
+                            + " error=" + cleanMessage(e));
+                    break;
                 }
-                HttpResponse<String> response = httpClient().send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-                appendDebugLog("HTTP RESPONSE", "GET " + uri + " status=" + response.statusCode() + " body=" + response.body());
-                if (response.statusCode() == 404) {
-                    continue;
-                }
-                if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                    throw new IOException("Vault secret read failed with HTTP " + response.statusCode());
-                }
-                Object parsed = new JsonParser(response.body()).parse();
-                Object data = vaultDataPayload(parsed);
-                List<TechnicalAccount> accounts = new ArrayList<>();
-                collectTechnicalAccounts(data, "", accounts, new HashSet<>());
-                List<OcsEndpoint> ocsEndpoints = new ArrayList<>();
-                collectOcsEndpoints(data, ocsEndpoints, new HashSet<>());
-                return new CloudRecoveryConfig(
-                        accounts,
-                        findFirstString(data, "cmaas_oauth_token_url", "cmaasOauthTokenUrl", "oauth_token_url", "oauthTokenUrl"),
-                        ocsEndpoints
-                );
-            } catch (Exception e) {
-                lastFailure = e;
-                appendDebugLog("HTTP ERROR", "Vault secret request path=" + path + " error=" + cleanMessage(e));
             }
         }
         if (lastFailure instanceof IOException ioe) {
@@ -1750,10 +1871,13 @@ public final class DnfUpdateApp {
     private static String serverActionUrl(String template, String serverId) {
         String clean = template.trim();
         if (clean.contains("%s")) {
-            return String.format(clean, urlPathEncode(serverId));
+            return clean.replace("%s", urlPathEncode(serverId));
         }
         while (clean.endsWith("/")) {
             clean = clean.substring(0, clean.length() - 1);
+        }
+        if (clean.endsWith("/servers")) {
+            return clean + "/" + urlPathEncode(serverId) + "/action";
         }
         return clean + "/servers/" + urlPathEncode(serverId) + "/action";
     }
@@ -2476,10 +2600,22 @@ public final class DnfUpdateApp {
                     };
                     let source = null;
 
+                    async function readJsonResponse(response) {
+                      const body = await response.text();
+                      if (!body.trim()) {
+                        throw new Error(`Server returned an empty response (HTTP ${response.status}). Check dnf-update-debug.log.`);
+                      }
+                      try {
+                        return JSON.parse(body);
+                      } catch (error) {
+                        throw new Error(`Server returned invalid JSON (HTTP ${response.status}): ${body.slice(0, 300)}`);
+                      }
+                    }
+
                     async function loadTechnicalAccounts() {
                       try {
                         const response = await fetch('/api/technical-accounts');
-                        const data = await response.json();
+                        const data = await readJsonResponse(response);
                         if (!response.ok) throw new Error(data.error || 'Unable to load accounts.');
                         technicalAccount.innerHTML = '<option value="">Select an account</option>';
                         (data.accounts || []).forEach(name => {
@@ -2545,7 +2681,7 @@ public final class DnfUpdateApp {
                           method: 'POST',
                           body: new URLSearchParams(new FormData(form))
                         });
-                        const data = await response.json();
+                        const data = await readJsonResponse(response);
                         if (!response.ok) throw new Error(data.error || 'Unable to start job.');
                         source = new EventSource(`/api/job/${encodeURIComponent(data.jobId)}/events`);
                         source.addEventListener('log', (message) => appendLine(JSON.parse(message.data)));
@@ -2563,8 +2699,13 @@ public final class DnfUpdateApp {
                             clearInterval(timer);
                             return;
                           }
-                          const status = await fetch(`/api/job/${encodeURIComponent(data.jobId)}`).then(r => r.json());
-                          updateSummary(status);
+                          try {
+                            const response = await fetch(`/api/job/${encodeURIComponent(data.jobId)}`);
+                            const status = await readJsonResponse(response);
+                            if (response.ok) updateSummary(status);
+                          } catch (error) {
+                            appendLine({time: new Date().toLocaleTimeString(), host: 'ui', level: 'warn', message: `Status refresh failed: ${error.message}`});
+                          }
                         }, 1200);
                       } catch (error) {
                         appendLine({time: new Date().toLocaleTimeString(), host: 'ui', level: 'error', message: error.message});
