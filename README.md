@@ -149,13 +149,14 @@ java -jar dnf-security-update-console.jar
 - Primary key: `key1.ppk`
 - Fallback key: `key2.ppk`
 - Command: `sudo -n dnf -y update --security`
+- Pre-reboot cleanup: `sudo -n dnf -y remove --oldinstallonly`
 - Reboot: enabled by default
 - Audit log: `patch-audit.log`
 - Post-reboot status log: `status-checks.tsv`
 - HTML reports: `reports\patch-report-YYYYMMDD-HHMMSS-<run-id>.html`
 - Dry run reports: `reports\dryrun-report-YYYYMMDD-HHMMSS-<run-id>.html`
 
-The app expects `cloud-user` to have passwordless sudo for `dnf` and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
+The app expects `cloud-user` to have passwordless sudo for `dnf` cleanup/update and reboot commands. If the primary PPK key cannot authenticate, it automatically tries the fallback key.
 
 ## UI Features
 

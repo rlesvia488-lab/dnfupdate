@@ -522,6 +522,7 @@ public final class DnfUpdateApp {
             runRemote(job, host, session, "if command -v needs-restarting >/dev/null 2>&1; then sudo -n needs-restarting -r; else echo 'needs-restarting not installed; continuing'; fi", true);
             runRemote(job, host, session, "sync");
             if (job.settings.reboot) {
+                runRemote(job, host, session, "sudo -n dnf -y remove --oldinstallonly");
                 String bootIdBefore = readBootId(job, host, session);
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
                 job.add(host, "info", "After the reboot command is sent, the app will check SSH every 10 seconds for up to 5 minutes.");
