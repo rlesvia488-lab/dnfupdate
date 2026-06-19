@@ -55,6 +55,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -63,10 +64,16 @@ public final class DnfUpdateApp {
     private static final int MAX_EVENT_HISTORY = 2000;
     private static final String AUDIT_LOG_FILE = "patch-audit.log";
     private static final String STATUS_LOG_FILE = "status-checks.tsv";
+    private static final String DEBUG_LOG_FILE = "dnf-update-debug.log";
     private static final String REPORT_DIR = "reports";
     private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
     private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
+    private static final Pattern SENSITIVE_JSON_PATTERN = Pattern.compile(
+            "(?i)(\\\"(?:access_token|refresh_token|client_token|client_secret|clientSecret|secret_id|secretId|role_id|roleId|password|token)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")");
+    private static final Pattern AUTHORIZATION_PATTERN = Pattern.compile(
+            "(?i)(Authorization\\s*[:=]\\s*(?:Bearer|Basic)\\s+)[^\\s,;]+"
+    );
     private static final List<String> HEALTHCHECK_URLS = List.of(
             "http://127.0.0.1:8080/actuator/health",
             "https://127.0.0.1:8443/actuator/health",
@@ -100,6 +107,7 @@ public final class DnfUpdateApp {
 
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
+    private final Object debugLogLock = new Object();
     private final Path appDir;
     private volatile VaultStatus vaultStatus = VaultStatus.disabled("Vault is disabled.");
     private volatile String vaultClientToken = "";
@@ -132,8 +140,11 @@ public final class DnfUpdateApp {
         System.out.println("Looking for key files next to the JAR in: " + appDir.toAbsolutePath());
         System.out.println("Patch audit log: " + appDir.resolve(AUDIT_LOG_FILE).toAbsolutePath());
         System.out.println("Post-reboot status log: " + appDir.resolve(STATUS_LOG_FILE).toAbsolutePath());
+        System.out.println("Debug log: " + appDir.resolve(DEBUG_LOG_FILE).toAbsolutePath());
         System.out.println("HTML reports directory: " + appDir.resolve(REPORT_DIR).toAbsolutePath());
         System.out.println("Vault status: " + app.vaultStatus.state() + " - " + app.vaultStatus.message());
+        app.appendDebugLog("STARTUP", "Application started on port " + port + "; Vault status=" + app.vaultStatus.state()
+                + "; appDir=" + appDir.toAbsolutePath());
     }
 
     private static Path findAppDir() {
@@ -162,6 +173,8 @@ public final class DnfUpdateApp {
         try {
             URI loginUri = URI.create(stripTrailingSlash(config.uri()) + "/v1/auth/approle/login");
             String body = "{\"role_id\":\"" + escapeJson(config.roleId()) + "\",\"secret_id\":\"" + escapeJson(config.secretId()) + "\"}";
+            appendDebugLog("HTTP REQUEST", "POST " + loginUri + " headers={Content-Type=application/json, X-Vault-Namespace="
+                    + (config.namespace().isBlank() ? "<none>" : config.namespace()) + "} body=" + body);
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(loginUri)
                     .timeout(Duration.ofMillis(5000))
                     .header("Content-Type", "application/json")
@@ -174,15 +187,19 @@ public final class DnfUpdateApp {
                     .connectTimeout(Duration.ofMillis(5000))
                     .build();
             HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            appendDebugLog("HTTP RESPONSE", "POST " + loginUri + " status=" + response.statusCode() + " body=" + response.body());
             Optional<String> token = extractJsonString(response.body(), "client_token");
             if (response.statusCode() >= 200 && response.statusCode() < 300 && token.isPresent()) {
                 vaultClientToken = token.get();
+                appendDebugLog("TOKEN", "Vault client token received length=" + vaultClientToken.length()
+                        + " sha256-prefix=" + sha256Hex(vaultClientToken).substring(0, 12) + " value=[REDACTED]");
                 vaultStatus = VaultStatus.up(config, "Connected to Vault with AppRole. Token was received and kept only in memory for the login check.");
             } else {
                 vaultClientToken = "";
                 vaultStatus = VaultStatus.down(config, "Vault AppRole login failed with HTTP " + response.statusCode() + ".");
             }
         } catch (Exception e) {
+            appendDebugLog("HTTP ERROR", "Vault AppRole login failed: " + cleanMessage(e));
             vaultClientToken = "";
             vaultStatus = VaultStatus.down(config, "Vault connection failed: " + cleanMessage(e));
         }
@@ -388,7 +405,8 @@ public final class DnfUpdateApp {
                 technicalAccountName
         );
 
-        Job job = new Job(UUID.randomUUID().toString(), hosts, settings, authorizedMember.get());
+        String jobId = UUID.randomUUID().toString();
+        Job job = new Job(jobId, hosts, settings, authorizedMember.get(), event -> appendDebugEvent(jobId, event));
         appendAuditLog(authorizedMember.get(), hosts, technicalAccountName);
         jobs.put(job.id, job);
         jobPool.submit(() -> runJob(job));
@@ -415,6 +433,31 @@ public final class DnfUpdateApp {
                 + " servers=" + String.join(",", hosts) + System.lineSeparator();
         Files.writeString(appDir.resolve(AUDIT_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
                 java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+    }
+
+    private void appendDebugEvent(String jobId, Event event) {
+        appendDebugLog("JOB", "jobId=" + jobId + " [" + event.host() + "] ["
+                + event.level().toUpperCase(Locale.ROOT) + "] " + event.message());
+    }
+
+    private void appendDebugLog(String category, String message) {
+        String safeMessage = redactSensitive(message == null ? "" : message)
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
+        String line = Instant.now() + " [" + category + "] " + safeMessage + System.lineSeparator();
+        synchronized (debugLogLock) {
+            try {
+                Files.writeString(appDir.resolve(DEBUG_LOG_FILE).normalize(), line, StandardCharsets.UTF_8,
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                System.err.println("Unable to write debug log: " + e.getMessage());
+            }
+        }
+    }
+
+    private static String redactSensitive(String value) {
+        String redacted = SENSITIVE_JSON_PATTERN.matcher(value).replaceAll("$1[REDACTED]$2");
+        return AUTHORIZATION_PATTERN.matcher(redacted).replaceAll("$1[REDACTED]");
     }
 
     private void handleTechnicalAccounts(HttpExchange exchange) throws IOException {
@@ -591,7 +634,7 @@ public final class DnfUpdateApp {
                     job.add(host, "warn", "Unable to write post-reboot status log: " + e.getMessage());
                 }
                 if (!status.machineUp()) {
-                    job.fail(host, "Update finished, but server was not reachable over SSH after reboot wait.");
+                    job.fail(host, "Update finished, but reboot could not be confirmed after the normal and hard-reboot recovery waits.");
                     return;
                 }
                 if (!status.serviceUp()) {
@@ -624,22 +667,25 @@ public final class DnfUpdateApp {
     }
 
     private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report, String bootIdBefore) {
-        job.add(host, "info", "Starting post-reboot SSH checks every 10 seconds for up to 5 minutes.");
-        SshWaitResult sshWait = waitForSsh(job, host, "Post-reboot SSH check attempt ");
+        job.add(host, "info", "Starting post-reboot checks every 10 seconds for up to 5 minutes. SSH will only be accepted after the Linux boot ID changes.");
+        SshWaitResult sshWait = waitForReboot(job, host, bootIdBefore, "Post-reboot SSH check attempt ");
         Session verificationSession = sshWait.session();
 
         if (verificationSession == null) {
-            job.add(host, "error", "Server was not reachable over SSH within 5 minutes after reboot. Last error: "
+            job.add(host, "error", "Reboot was not confirmed within 5 minutes. Last check: "
                     + (sshWait.lastFailure() == null ? "timeout" : cleanMessage(sshWait.lastFailure())));
-            if (forceHardRebootWithCloudApi(job, host)) {
-                job.add(host, "info", "Hard reboot API request was accepted. Checking SSH every 10 seconds for up to 5 minutes.");
-                sshWait = waitForSsh(job, host, "Post-hard-reboot SSH check attempt ");
+            boolean hardRebootAccepted = forceHardRebootWithCloudApi(job, host);
+            if (hardRebootAccepted) {
+                job.add(host, "info", "Hard reboot API request was accepted. Checking for a changed Linux boot ID every 10 seconds for up to 5 minutes.");
+                sshWait = waitForReboot(job, host, bootIdBefore, "Post-hard-reboot SSH check attempt ");
                 verificationSession = sshWait.session();
             }
             if (verificationSession == null) {
                 report.machineUpAfterReboot = false;
                 report.serviceUpAfterReboot = false;
-                job.add(host, "error", "Server was still not reachable over SSH after hard reboot API recovery. Last error: "
+                job.add(host, "error", (hardRebootAccepted
+                        ? "Reboot was still not confirmed after hard reboot API recovery. Last check: "
+                        : "Reboot was not confirmed and hard reboot API recovery was not accepted. Last check: ")
                         + (sshWait.lastFailure() == null ? "timeout" : cleanMessage(sshWait.lastFailure())));
                 return new PostRebootStatus(false, false, Optional.empty());
             }
@@ -649,13 +695,7 @@ public final class DnfUpdateApp {
             report.machineUpAfterReboot = true;
             job.add(host, "success", "Server is reachable over SSH after reboot.");
 
-            String bootIdAfter = readBootId(job, host, verificationSession);
-            if (!bootIdBefore.isBlank() && !bootIdAfter.isBlank()) {
-                if (bootIdBefore.equals(bootIdAfter)) {
-                    report.serviceUpAfterReboot = false;
-                    job.add(host, "error", "SSH is reachable, but Linux boot ID did not change. Reboot was not confirmed, so service checks were skipped.");
-                    return new PostRebootStatus(true, false, Optional.empty());
-                }
+            if (!bootIdBefore.isBlank()) {
                 job.add(host, "success", "Reboot confirmed because Linux boot ID changed.");
             } else {
                 job.add(host, "warn", "Linux boot ID could not be confirmed. Continuing with SSH reachability as the machine-up check.");
@@ -692,23 +732,48 @@ public final class DnfUpdateApp {
         }
     }
 
-    private SshWaitResult waitForSsh(Job job, String host, String attemptPrefix) {
+    private SshWaitResult waitForReboot(Job job, String host, String bootIdBefore, String attemptPrefix) {
         long deadline = System.currentTimeMillis() + REBOOT_VERIFY_TIMEOUT_MILLIS;
         int attempt = 1;
         Exception lastFailure = null;
         while (System.currentTimeMillis() <= deadline) {
+            Session session = null;
             try {
                 job.add(host, "info", attemptPrefix + attempt + ".");
-                return new SshWaitResult(connect(job, host), null);
+                session = connect(job, host);
+                if (bootIdBefore.isBlank()) {
+                    if (attempt > 1) {
+                        Session acceptedSession = session;
+                        session = null;
+                        return new SshWaitResult(acceptedSession, null);
+                    }
+                    lastFailure = new IOException("SSH is reachable, but the pre-reboot boot ID is unavailable; waiting before accepting the connection");
+                    job.add(host, "info", "SSH is reachable, but waiting for the reboot grace period before accepting it.");
+                } else {
+                    String bootIdAfter = readBootId(job, host, session);
+                    if (!bootIdAfter.isBlank() && !bootIdBefore.equals(bootIdAfter)) {
+                        Session acceptedSession = session;
+                        session = null;
+                        return new SshWaitResult(acceptedSession, null);
+                    }
+                    lastFailure = new IOException(bootIdAfter.isBlank()
+                            ? "SSH is reachable, but the Linux boot ID could not be read"
+                            : "SSH is reachable, but the Linux boot ID has not changed yet");
+                    job.add(host, "info", cleanMessage(lastFailure) + "; continuing to wait for reboot completion.");
+                }
             } catch (Exception e) {
                 lastFailure = e;
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    break;
+            } finally {
+                if (session != null) {
+                    session.disconnect();
                 }
-                sleep(Math.min(REBOOT_VERIFY_INTERVAL_MILLIS, remaining));
-                attempt++;
             }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                break;
+            }
+            sleep(Math.min(REBOOT_VERIFY_INTERVAL_MILLIS, remaining));
+            attempt++;
         }
         return new SshWaitResult(null, lastFailure);
     }
@@ -769,6 +834,8 @@ public final class DnfUpdateApp {
         for (String path : candidatePaths) {
             try {
                 URI uri = URI.create(stripTrailingSlash(config.uri()) + path);
+                appendDebugLog("HTTP REQUEST", "GET " + uri + " headers={X-Vault-Token=[REDACTED], X-Vault-Namespace="
+                        + (config.namespace().isBlank() ? "<none>" : config.namespace()) + "}");
                 HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(uri)
                         .timeout(Duration.ofMillis(15000))
                         .header("X-Vault-Token", vaultClientToken)
@@ -777,6 +844,7 @@ public final class DnfUpdateApp {
                     requestBuilder.header("X-Vault-Namespace", config.namespace());
                 }
                 HttpResponse<String> response = httpClient().send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                appendDebugLog("HTTP RESPONSE", "GET " + uri + " status=" + response.statusCode() + " body=" + response.body());
                 if (response.statusCode() == 404) {
                     continue;
                 }
@@ -796,6 +864,7 @@ public final class DnfUpdateApp {
                 );
             } catch (Exception e) {
                 lastFailure = e;
+                appendDebugLog("HTTP ERROR", "Vault secret request path=" + path + " error=" + cleanMessage(e));
             }
         }
         if (lastFailure instanceof IOException ioe) {
@@ -940,7 +1009,11 @@ public final class DnfUpdateApp {
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
+        appendDebugLog("HTTP REQUEST", "POST " + config.oauthTokenUrl() + " account=" + account.name()
+                + " headers={Authorization=Basic [REDACTED], Content-Type=application/x-www-form-urlencoded} body=" + body);
         HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        appendDebugLog("HTTP RESPONSE", "POST " + config.oauthTokenUrl() + " status=" + response.statusCode()
+                + " body=" + response.body());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IOException("OAuth token request failed with HTTP " + response.statusCode());
         }
@@ -949,6 +1022,8 @@ public final class DnfUpdateApp {
         if (token.isBlank()) {
             throw new IOException("OAuth response did not contain access_token");
         }
+        appendDebugLog("TOKEN", "OAuth access token received for account=" + account.name() + " length=" + token.length()
+                + " sha256-prefix=" + sha256Hex(token).substring(0, 12) + " value=[REDACTED]");
         return token;
     }
 
@@ -956,6 +1031,8 @@ public final class DnfUpdateApp {
         Exception lastFailure = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
+                appendDebugLog("HTTP REQUEST", "GET " + endpoint.serversUrl() + " endpoint=" + endpoint.name()
+                        + " attempt=" + attempt + " headers={Authorization=Bearer [REDACTED], Content-Type=application/json}");
                 HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint.serversUrl()))
                         .timeout(Duration.ofMillis(15000))
                         .header("Content-Type", "application/json")
@@ -963,6 +1040,8 @@ public final class DnfUpdateApp {
                         .GET()
                         .build();
                 HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                appendDebugLog("HTTP RESPONSE", "GET " + endpoint.serversUrl() + " endpoint=" + endpoint.name()
+                        + " attempt=" + attempt + " status=" + response.statusCode() + " body=" + response.body());
                 if (response.statusCode() == 200) {
                     Object parsed = new JsonParser(response.body()).parse();
                     return findMatchingServer(parsed, host);
@@ -970,6 +1049,8 @@ public final class DnfUpdateApp {
                 throw new IOException("OCS server list failed with HTTP " + response.statusCode());
             } catch (Exception e) {
                 lastFailure = e;
+                appendDebugLog("HTTP ERROR", "GET " + endpoint.serversUrl() + " endpoint=" + endpoint.name()
+                        + " attempt=" + attempt + " error=" + cleanMessage(e));
                 if (attempt < 3) {
                     sleep(5000);
                 }
@@ -1009,13 +1090,18 @@ public final class DnfUpdateApp {
 
     private void sendHardReboot(CloudServer server, String accessToken, OcsEndpoint endpoint) throws IOException, InterruptedException {
         String body = "{\"reboot\":{\"type\":\"HARD\"}}";
-        HttpRequest request = HttpRequest.newBuilder(URI.create(serverActionUrl(endpoint.actionUrl(), server.id())))
+        String actionUrl = serverActionUrl(endpoint.actionUrl(), server.id());
+        appendDebugLog("HTTP REQUEST", "POST " + actionUrl + " endpoint=" + endpoint.name() + " serverId=" + server.id()
+                + " headers={Authorization=Bearer [REDACTED], Content-Type=application/json} body=" + body);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(actionUrl))
                 .timeout(Duration.ofMillis(15000))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + accessToken)
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        appendDebugLog("HTTP RESPONSE", "POST " + actionUrl + " endpoint=" + endpoint.name() + " serverId=" + server.id()
+                + " status=" + response.statusCode() + " body=" + response.body());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IOException("OCS hard reboot action failed with HTTP " + response.statusCode());
         }
@@ -1840,6 +1926,7 @@ public final class DnfUpdateApp {
         private final List<String> hosts;
         private final Settings settings;
         private final String authorizedMember;
+        private final Consumer<Event> eventSink;
         private final ConcurrentLinkedDeque<Event> events = new ConcurrentLinkedDeque<>();
         private final Map<String, String> hostStatus = new ConcurrentHashMap<>();
         private final Map<String, HostReport> reports = new ConcurrentHashMap<>();
@@ -1847,11 +1934,12 @@ public final class DnfUpdateApp {
         private final AtomicInteger succeeded = new AtomicInteger(0);
         private final AtomicInteger failed = new AtomicInteger(0);
 
-        private Job(String id, List<String> hosts, Settings settings, String authorizedMember) {
+        private Job(String id, List<String> hosts, Settings settings, String authorizedMember, Consumer<Event> eventSink) {
             this.id = id;
             this.hosts = List.copyOf(hosts);
             this.settings = settings;
             this.authorizedMember = authorizedMember;
+            this.eventSink = eventSink;
             hosts.forEach(host -> hostStatus.put(host, "queued"));
             hosts.forEach(host -> reports.put(host, new HostReport()));
         }
@@ -1878,7 +1966,9 @@ public final class DnfUpdateApp {
         }
 
         private void add(String host, String level, String message) {
-            events.add(new Event(Instant.now(), host, level, message));
+            Event event = new Event(Instant.now(), host, level, message);
+            events.add(event);
+            eventSink.accept(event);
             while (events.size() > MAX_EVENT_HISTORY) {
                 events.pollFirst();
             }
