@@ -66,8 +66,13 @@ For hard reboot recovery, store one or more technical accounts in the Vault secr
 ```json
 {
   "cmaas_oauth_token_url": "oauth-token-url",
-  "ocs_servers_url": "ocs-server-detail-url",
-  "ocs_server_action_url": "ocs-server-action-url-or-template-with-%s",
+  "ocs_endpoints": [
+    {
+      "region": "paris-or-north",
+      "ocs_servers_url": "ocs-server-detail-url",
+      "ocs_server_action_url": "ocs-server-action-url-or-template-with-%s"
+    }
+  ],
   "account_id": "account-id",
   "client_id": "oauth-client-id",
   "client_secret": "oauth-client-secret"
@@ -81,8 +86,18 @@ For example, one Vault secret can contain shared cloud API URLs and multiple tec
 ```json
 {
   "cmaas_oauth_token_url": "https://cmaas.example.com/oauth/token",
-  "ocs_servers_url": "https://ocs.example.com/v1/servers",
-  "ocs_server_action_url": "https://ocs.example.com/v1/servers/%s/action",
+  "ocs_endpoints": [
+    {
+      "region": "paris",
+      "ocs_servers_url": "https://ocs-paris.example.com/v1/servers",
+      "ocs_server_action_url": "https://ocs-paris.example.com/v1/servers/%s/action"
+    },
+    {
+      "region": "north",
+      "ocs_servers_url": "https://ocs-north.example.com/v1/servers",
+      "ocs_server_action_url": "https://ocs-north.example.com/v1/servers/%s/action"
+    }
+  ],
   "technical_accounts": [
     {
       "account_id": "technical-account-01",
@@ -103,13 +118,13 @@ For example, one Vault secret can contain shared cloud API URLs and multiple tec
 }
 ```
 
-Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. During hard reboot recovery, the app tries the accounts in their stored order until it successfully finds and reboots the target server.
+Store this object at the path configured by `VAULT_TECH_ACCOUNTS_PATH`. Replace the example URLs and credentials with real values; do not commit client secrets to the repository. During hard reboot recovery, the app tries the accounts and the Paris/North OCS endpoints in their stored order until it successfully finds and reboots the target server. A legacy secret containing one top-level OCS URL pair remains supported.
 
 When a server is not reachable over SSH after the normal reboot wait, the app:
 
 1. Reads all technical accounts from Vault.
 2. Requests a CMAAS OAuth token for each account.
-3. Calls the OCS servers URL fetched from Vault.
+3. Calls each Paris/North OCS servers URL fetched from Vault.
 4. Matches the input server by `accessIPv4` or server `name`.
 5. Calls the OCS server action URL fetched from Vault with `{"reboot":{"type":"HARD"}}`.
 6. Checks SSH again every 10 seconds for up to 5 minutes.

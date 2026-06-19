@@ -675,15 +675,24 @@ public final class DnfUpdateApp {
                 try {
                     job.add(host, "info", "Requesting CMAAS OAuth token for account " + account.accountId() + ".");
                     String accessToken = requestCmaasToken(account, recoveryConfig);
-                    Optional<CloudServer> server = findCloudServer(host, accessToken, recoveryConfig);
-                    if (server.isEmpty()) {
-                        job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host + " in OCS.");
-                        continue;
+                    for (OcsEndpoint endpoint : recoveryConfig.ocsEndpoints()) {
+                        try {
+                            Optional<CloudServer> server = findCloudServer(host, accessToken, endpoint);
+                            if (server.isEmpty()) {
+                                job.add(host, "warn", "Account " + account.accountId() + " did not see server " + host
+                                        + " in OCS endpoint " + endpoint.name() + ".");
+                                continue;
+                            }
+                            sendHardReboot(server.get(), accessToken, endpoint);
+                            job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
+                                    + " (" + server.get().name() + ") using account " + account.accountId()
+                                    + " via " + endpoint.name() + ".");
+                            return true;
+                        } catch (Exception e) {
+                            job.add(host, "warn", "OCS endpoint " + endpoint.name() + " failed for account "
+                                    + account.accountId() + ": " + cleanMessage(e));
+                        }
                     }
-                    sendHardReboot(server.get(), accessToken, recoveryConfig);
-                    job.add(host, "success", "Hard reboot API request sent for OCS server " + server.get().id()
-                            + " (" + server.get().name() + ") using account " + account.accountId() + ".");
-                    return true;
                 } catch (Exception e) {
                     job.add(host, "warn", "Hard reboot attempt with account " + account.accountId() + " failed: " + cleanMessage(e));
                 }
@@ -718,11 +727,12 @@ public final class DnfUpdateApp {
                 Object data = vaultDataPayload(parsed);
                 List<TechnicalAccount> accounts = new ArrayList<>();
                 collectTechnicalAccounts(data, accounts, new HashSet<>());
+                List<OcsEndpoint> ocsEndpoints = new ArrayList<>();
+                collectOcsEndpoints(data, ocsEndpoints, new HashSet<>());
                 return new CloudRecoveryConfig(
                         accounts,
                         findFirstString(data, "cmaas_oauth_token_url", "cmaasOauthTokenUrl", "oauth_token_url", "oauthTokenUrl"),
-                        findFirstString(data, "ocs_servers_url", "ocsServersUrl", "servers_url", "serversUrl"),
-                        findFirstString(data, "ocs_server_action_url", "ocsServerActionUrl", "server_action_url", "serverActionUrl")
+                        ocsEndpoints
                 );
             } catch (Exception e) {
                 lastFailure = e;
@@ -737,7 +747,7 @@ public final class DnfUpdateApp {
         if (lastFailure != null) {
             throw new IOException(lastFailure);
         }
-        return new CloudRecoveryConfig(List.of(), "", "", "");
+        return new CloudRecoveryConfig(List.of(), "", List.of());
     }
 
     private static List<String> vaultSecretPaths(String configuredPath) {
@@ -786,6 +796,27 @@ public final class DnfUpdateApp {
         } else if (value instanceof Collection<?> collection) {
             for (Object nested : collection) {
                 collectTechnicalAccounts(nested, accounts, seen);
+            }
+        }
+    }
+
+    private static void collectOcsEndpoints(Object value, List<OcsEndpoint> endpoints, Set<String> seen) {
+        if (value instanceof Map<?, ?> map) {
+            String serversUrl = firstNonBlank(map, "ocs_servers_url", "ocsServersUrl", "servers_url", "serversUrl");
+            String actionUrl = firstNonBlank(map, "ocs_server_action_url", "ocsServerActionUrl", "server_action_url", "serverActionUrl");
+            if (!serversUrl.isBlank() && !actionUrl.isBlank()) {
+                String key = serversUrl + "\n" + actionUrl;
+                if (seen.add(key)) {
+                    String name = firstNonBlank(map, "region", "name", "location");
+                    endpoints.add(new OcsEndpoint(name.isBlank() ? "default" : name, serversUrl, actionUrl));
+                }
+            }
+            for (Object nested : map.values()) {
+                collectOcsEndpoints(nested, endpoints, seen);
+            }
+        } else if (value instanceof Collection<?> collection) {
+            for (Object nested : collection) {
+                collectOcsEndpoints(nested, endpoints, seen);
             }
         }
     }
@@ -853,14 +884,11 @@ public final class DnfUpdateApp {
         return token;
     }
 
-    private Optional<CloudServer> findCloudServer(String host, String accessToken, CloudRecoveryConfig config) throws IOException, InterruptedException {
-        if (config.ocsServersUrl().isBlank()) {
-            throw new IOException("OCS servers URL is missing from Vault");
-        }
+    private Optional<CloudServer> findCloudServer(String host, String accessToken, OcsEndpoint endpoint) throws IOException, InterruptedException {
         Exception lastFailure = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
             try {
-                HttpRequest request = HttpRequest.newBuilder(URI.create(config.ocsServersUrl()))
+                HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint.serversUrl()))
                         .timeout(Duration.ofMillis(15000))
                         .header("Content-Type", "application/json")
                         .header("Authorization", "Bearer " + accessToken)
@@ -911,12 +939,9 @@ public final class DnfUpdateApp {
         return Optional.empty();
     }
 
-    private void sendHardReboot(CloudServer server, String accessToken, CloudRecoveryConfig config) throws IOException, InterruptedException {
-        if (config.ocsServerActionUrl().isBlank()) {
-            throw new IOException("OCS server action URL is missing from Vault");
-        }
+    private void sendHardReboot(CloudServer server, String accessToken, OcsEndpoint endpoint) throws IOException, InterruptedException {
         String body = "{\"reboot\":{\"type\":\"HARD\"}}";
-        HttpRequest request = HttpRequest.newBuilder(URI.create(serverActionUrl(config.ocsServerActionUrl(), server.id())))
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverActionUrl(endpoint.actionUrl(), server.id())))
                 .timeout(Duration.ofMillis(15000))
                 .header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + accessToken)
@@ -1663,14 +1688,16 @@ public final class DnfUpdateApp {
     private record CloudServer(String id, String name, String accessIPv4) {
     }
 
+    private record OcsEndpoint(String name, String serversUrl, String actionUrl) {
+    }
+
     private record CloudRecoveryConfig(
             List<TechnicalAccount> accounts,
             String oauthTokenUrl,
-            String ocsServersUrl,
-            String ocsServerActionUrl
+            List<OcsEndpoint> ocsEndpoints
     ) {
         private boolean isComplete() {
-            return !oauthTokenUrl.isBlank() && !ocsServersUrl.isBlank() && !ocsServerActionUrl.isBlank();
+            return !oauthTokenUrl.isBlank() && !ocsEndpoints.isEmpty();
         }
     }
 
