@@ -69,6 +69,8 @@ public final class DnfUpdateApp {
     private static final String REPORT_DIR = "reports";
     private static final long REBOOT_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
     private static final long REBOOT_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
+    private static final long SERVICE_VERIFY_TIMEOUT_MILLIS = 5 * 60 * 1000L;
+    private static final long SERVICE_VERIFY_INTERVAL_MILLIS = 10 * 1000L;
     private static final long COMPLETED_JOB_RETENTION_SECONDS = 24 * 60 * 60;
     private static final long DEBUG_LOG_MAX_BYTES = 50L * 1024 * 1024;
     private static final int DEBUG_LOG_BACKUPS = 5;
@@ -742,7 +744,7 @@ public final class DnfUpdateApp {
                     return;
                 }
                 if (!status.serviceUp()) {
-                    job.fail(host, "Update finished and server is reachable, but no configured health check returned HTTP 200.");
+                    job.fail(host, "Update finished and server is reachable, but no configured health check returned HTTP 200 within 5 minutes.");
                     return;
                 }
                 job.succeed(host, "Update finished, reboot verified, and service is up via " + status.workingHealthcheck().orElse("unknown health check") + ".");
@@ -809,20 +811,15 @@ public final class DnfUpdateApp {
             runRemote(job, host, verificationSession, "sudo -n systemctl enable otelcol-contrib.service");
             runRemote(job, host, verificationSession, "sudo -n systemctl start otelcol-contrib.service");
 
-            for (String url : HEALTHCHECK_URLS) {
-                String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time 10 " + shellQuote(url);
-                RemoteResult result = runRemote(job, host, verificationSession, command, true);
-                String statusCode = result.lines().isEmpty() ? "" : result.lines().get(result.lines().size() - 1).trim();
-                if ("200".equals(statusCode)) {
-                    report.serviceUpAfterReboot = true;
-                    report.workingHealthcheck = url;
-                    job.add(host, "success", "Service health check returned HTTP 200: " + url);
-                    return new PostRebootStatus(true, true, Optional.of(url));
-                }
+            Optional<String> workingHealthcheck = waitForHealthyService(job, host, verificationSession);
+            if (workingHealthcheck.isPresent()) {
+                report.serviceUpAfterReboot = true;
+                report.workingHealthcheck = workingHealthcheck.get();
+                return new PostRebootStatus(true, true, workingHealthcheck);
             }
 
             report.serviceUpAfterReboot = false;
-            job.add(host, "error", "Server is reachable, but none of the configured health checks returned HTTP 200.");
+            job.add(host, "error", "Server is reachable, but none of the configured health checks returned HTTP 200 within 5 minutes.");
             return new PostRebootStatus(true, false, Optional.empty());
         } catch (Exception e) {
             report.machineUpAfterReboot = true;
@@ -834,6 +831,38 @@ public final class DnfUpdateApp {
                 verificationSession.disconnect();
             }
         }
+    }
+
+    private Optional<String> waitForHealthyService(Job job, String host, Session session) throws Exception {
+        long deadline = System.currentTimeMillis() + SERVICE_VERIFY_TIMEOUT_MILLIS;
+        int attempt = 1;
+        job.add(host, "info", "Starting service health checks every 10 seconds for up to 5 minutes.");
+        while (System.currentTimeMillis() <= deadline) {
+            job.add(host, "info", "Service health check attempt " + attempt + ".");
+            for (String url : HEALTHCHECK_URLS) {
+                long requestTimeRemaining = deadline - System.currentTimeMillis();
+                if (requestTimeRemaining <= 0) {
+                    return Optional.empty();
+                }
+                long curlTimeoutSeconds = Math.max(1L, Math.min(10L, (requestTimeRemaining + 999L) / 1000L));
+                String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time "
+                        + curlTimeoutSeconds + " " + shellQuote(url);
+                RemoteResult result = runRemote(job, host, session, command, true);
+                String statusCode = result.lines().isEmpty() ? "" : result.lines().get(result.lines().size() - 1).trim();
+                if ("200".equals(statusCode)) {
+                    job.add(host, "success", "Service health check returned HTTP 200: " + url);
+                    return Optional.of(url);
+                }
+            }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                break;
+            }
+            job.add(host, "info", "Service is not ready yet; retrying health checks in 10 seconds.");
+            sleep(Math.min(SERVICE_VERIFY_INTERVAL_MILLIS, remaining));
+            attempt++;
+        }
+        return Optional.empty();
     }
 
     private SshWaitResult waitForReboot(Job job, String host, String bootIdBefore, String attemptPrefix) {
