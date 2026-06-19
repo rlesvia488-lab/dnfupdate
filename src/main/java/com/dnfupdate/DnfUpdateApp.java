@@ -1118,10 +1118,8 @@ public final class DnfUpdateApp {
         }
         String scope = account.accountId() + ":sgcp:cmaas:write_node "
                 + account.accountId() + ":sgcp:cmaas:read "
-                + account.accountId() + ":sgcp:lbaas:read "
                 + account.accountId() + ":sgcp:ocs:read "
-                + account.accountId() + ":sgcp:files:read "
-                + account.accountId() + ":sgcp:files:write";
+                + account.accountId() + ":sgcp:ocs:write";
         String body = "grant_type=client_credentials&scope=" + URLEncoder.encode(scope, StandardCharsets.UTF_8);
         String basic = Base64.getEncoder().encodeToString((account.clientId() + ":" + account.clientSecret()).getBytes(StandardCharsets.UTF_8));
         HttpRequest request = HttpRequest.newBuilder(URI.create(config.oauthTokenUrl()))

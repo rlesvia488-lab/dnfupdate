@@ -137,6 +137,8 @@ When a server is not reachable over SSH after the normal reboot wait, the app:
 5. Calls the OCS server action URL fetched from Vault with `{"reboot":{"type":"HARD"}}`.
 6. Checks SSH again every 10 seconds for up to 5 minutes.
 
+The CMAAS client-credentials token request uses these scopes for the selected technical account: `<account_id>:sgcp:cmaas:write_node`, `<account_id>:sgcp:cmaas:read`, `<account_id>:sgcp:ocs:read`, and `<account_id>:sgcp:ocs:write`.
+
 When reboot is enabled, the app records the Linux boot ID, sends the reboot command in the background, then checks SSH every 10 seconds for up to 5 minutes. An SSH connection is accepted only after the Linux boot ID changes; if SSH reconnects before the delayed reboot begins, the app keeps waiting instead of treating that connection as a completed reboot. If no changed boot ID is observed within 5 minutes, hard reboot API recovery is attempted. After confirming the reboot, the app runs `sudo -n systemctl enable otelcol-contrib.service` and `sudo -n systemctl start otelcol-contrib.service`, then performs the configured service health checks. If any configured health check returns HTTP 200, the service is marked up and only that working health check is shown.
 
 Post-reboot machine and service status is stored in:
