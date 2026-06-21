@@ -173,8 +173,15 @@ Dry run report columns are:
 
 - Server
 - Status
+- Security Updates Available (`YES` or `NO`)
+- Installed Kernel Count
+- Installed Kernels
 - RHSA Available To Install
 - All Installed RHSA In The OS
+
+The dry-run summary shows how many servers still have security updates available. Installed kernel inventory uses `kernel-core` packages when present and falls back to `kernel` packages.
+
+Long RHSA Available To Install lists are collapsed by default in dry-run and patch reports. Select the “Show N advisories” control to expand a server's complete list.
 
 To browse reports from the app, open:
 

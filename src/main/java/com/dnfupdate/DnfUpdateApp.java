@@ -698,7 +698,10 @@ public final class DnfUpdateApp {
             }
             RemoteResult beforeSecurity = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --updates", true);
             report.rhsaPresentBefore.addAll(extractRhsa(beforeSecurity.lines()));
-            if (report.rhsaPresentBefore.isEmpty()) {
+            report.securityInventoryCollected = beforeSecurity.exitStatus() == 0;
+            if (!report.securityInventoryCollected) {
+                job.add(host, "warn", "Unable to determine whether RHSA security advisories are available to install.");
+            } else if (report.rhsaPresentBefore.isEmpty()) {
                 job.add(host, "info", "No RHSA security advisories are currently available to install.");
             } else {
                 job.add(host, "info", "RHSA available to install: " + String.join(", ", report.rhsaPresentBefore));
@@ -706,6 +709,19 @@ public final class DnfUpdateApp {
             if (job.settings.dryRun) {
                 RemoteResult installedOnly = runRemote(job, host, session, "sudo -n dnf updateinfo list --security --installed", true);
                 report.rhsaInstalledAfter.addAll(extractRhsa(installedOnly.lines()));
+                RemoteResult installedKernels = runRemote(job, host, session,
+                        "if rpm -q kernel-core >/dev/null 2>&1; then rpm -q kernel-core --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n'; else rpm -q kernel --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n'; fi",
+                        true);
+                if (installedKernels.exitStatus() == 0) {
+                    installedKernels.lines().stream()
+                            .map(String::trim)
+                            .filter(line -> !line.isBlank())
+                            .forEach(report.installedKernels::add);
+                    report.kernelInventoryCollected = true;
+                    job.add(host, "info", "Installed kernel count: " + report.installedKernels.size() + ".");
+                } else {
+                    job.add(host, "warn", "Unable to determine the installed kernel count.");
+                }
                 job.succeed(host, "Dry run finished. No update or reboot commands were executed.");
                 return;
             }
@@ -1412,6 +1428,8 @@ public final class DnfUpdateApp {
                     th, td { border-bottom: 1px solid #d8dee9; padding: 10px; text-align: left; vertical-align: top; }
                     th { background: #eef2f7; font-size: 13px; }
                     ul { margin: 0; padding-left: 18px; }
+                    details.expand-list summary { cursor: pointer; color: #1d4ed8; font-weight: 700; white-space: nowrap; }
+                    details.expand-list[open] summary { margin-bottom: 8px; }
                     .success { color: #15803d; font-weight: 700; }
                     .failed { color: #b91c1c; font-weight: 700; }
                     .running, .queued { color: #1d4ed8; font-weight: 700; }
@@ -1435,17 +1453,23 @@ public final class DnfUpdateApp {
                 .append("</div>")
                 .append("</div>");
 
+        long serversWithUpdates = job.hosts.stream()
+                .map(job::reportFor)
+                .filter(report -> !report.rhsaPresentBefore.isEmpty())
+                .count();
         html.append("<div class=\"summary grid\">")
                 .append(stat("Total", job.hosts.size()))
                 .append(stat("Succeeded", job.succeeded.get()))
                 .append(stat("Failed", job.failed.get()))
-                .append(stat("Reboot Requested", !job.settings.dryRun && job.settings.reboot ? "Yes" : "No"))
+                .append(job.settings.dryRun
+                        ? stat("Servers With Updates", Long.toString(serversWithUpdates))
+                        : stat("Reboot Requested", job.settings.reboot ? "Yes" : "No"))
                 .append("</div>");
 
         html.append("<h2>Server Status And RHSA</h2>");
         html.append("<table><thead><tr>");
         if (job.settings.dryRun) {
-            html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
+            html.append("<th>Server</th><th>Status</th><th>Security Updates Available</th><th>Installed Kernel Count</th><th>Installed Kernels</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
         } else if (job.settings.reboot) {
             html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th><th>Machine After Reboot</th><th>Service After Reboot</th><th>Working Healthcheck</th>");
         } else {
@@ -1459,8 +1483,16 @@ public final class DnfUpdateApp {
             String status = job.hostStatus.getOrDefault(host, "unknown");
             html.append("<tr>")
                     .append("<td>").append(escapeHtml(host)).append("</td>")
-                    .append("<td class=\"").append(escapeHtml(status)).append("\">").append(escapeHtml(status)).append("</td>")
-                    .append("<td>").append(advisoryList(report.rhsaPresentBefore)).append("</td>");
+                    .append("<td class=\"").append(escapeHtml(status)).append("\">").append(escapeHtml(status)).append("</td>");
+            if (job.settings.dryRun) {
+                html.append(availabilityCell(report.securityInventoryCollected
+                                ? !report.rhsaPresentBefore.isEmpty() : null))
+                        .append("<td>").append(report.kernelInventoryCollected ? report.installedKernels.size() : "UNKNOWN").append("</td>")
+                        .append("<td>").append(report.kernelInventoryCollected
+                                ? collapsibleList(report.installedKernels, "kernel", "kernels")
+                                : "<span class=\"empty\">Unable to determine</span>").append("</td>");
+            }
+            html.append("<td>").append(collapsibleAdvisoryList(report.rhsaPresentBefore)).append("</td>");
             if (!job.settings.dryRun) {
                 html.append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>");
             }
@@ -1745,6 +1777,15 @@ public final class DnfUpdateApp {
         return "<td class=\"" + css + "\">" + escapeHtml(normalized) + "</td>";
     }
 
+    private static String availabilityCell(Boolean available) {
+        if (available == null) {
+            return "<td class=\"empty\">UNKNOWN</td>";
+        }
+        return available
+                ? "<td class=\"failed\">YES</td>"
+                : "<td class=\"success\">NO</td>";
+    }
+
     private static String formatBytes(long bytes) {
         if (bytes < 1024) {
             return bytes + " B";
@@ -1774,6 +1815,26 @@ public final class DnfUpdateApp {
             }
         }
         html.append("</ul>");
+        return html.toString();
+    }
+
+    private static String collapsibleAdvisoryList(Set<String> advisories) {
+        return collapsibleList(advisories, "advisory", "advisories");
+    }
+
+    private static String collapsibleList(Set<String> values, String singularLabel, String pluralLabel) {
+        if (values.isEmpty()) {
+            return "<span class=\"empty\">None recorded</span>";
+        }
+        int size = values.size();
+        StringBuilder html = new StringBuilder("<details class=\"expand-list\"><summary>Show ")
+                .append(size).append(' ').append(size == 1 ? singularLabel : pluralLabel).append("</summary><ul>");
+        synchronized (values) {
+            for (String value : values) {
+                html.append("<li>").append(escapeHtml(value)).append("</li>");
+            }
+        }
+        html.append("</ul></details>");
         return html.toString();
     }
 
@@ -2066,6 +2127,9 @@ public final class DnfUpdateApp {
         private final Set<String> rhsaPresentBefore = Collections.synchronizedSet(new TreeSet<>());
         private final Set<String> rhsaInstalledAfter = Collections.synchronizedSet(new TreeSet<>());
         private final Set<String> rhsaCorrected = Collections.synchronizedSet(new TreeSet<>());
+        private final Set<String> installedKernels = Collections.synchronizedSet(new TreeSet<>());
+        private volatile boolean securityInventoryCollected;
+        private volatile boolean kernelInventoryCollected;
         private volatile Boolean machineUpAfterReboot;
         private volatile Boolean serviceUpAfterReboot;
         private volatile String workingHealthcheck;
