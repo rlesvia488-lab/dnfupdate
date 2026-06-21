@@ -823,6 +823,10 @@ public final class DnfUpdateApp {
                 job.add(host, "warn", "Linux boot ID could not be confirmed. Continuing with SSH reachability as the machine-up check.");
             }
 
+            job.add(host, "info", "Setting SELinux to permissive mode and restarting fabio after reboot.");
+            runRemote(job, host, verificationSession, "sudo -n setenforce 0", true);
+            runRemote(job, host, verificationSession, "sudo -n systemctl restart fabio");
+
             job.add(host, "info", "Enabling and starting otelcol-contrib.service after reboot.");
             runRemote(job, host, verificationSession, "sudo -n systemctl enable otelcol-contrib.service");
             runRemote(job, host, verificationSession, "sudo -n systemctl start otelcol-contrib.service");
