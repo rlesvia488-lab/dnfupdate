@@ -173,15 +173,17 @@ Dry run report columns are:
 
 - Server
 - Status
+- Compliance (`COMPLIANT`, `NOT COMPLIANT`, or `UNKNOWN`)
+- Compliance Reason
 - Security Updates Available (`YES` or `NO`)
 - Installed Kernel Count
 - Installed Kernels
 - RHSA Available To Install
 - All Installed RHSA In The OS
 
-The dry-run summary shows how many servers still have security updates available. Installed kernel inventory uses `kernel-core` packages when present and falls back to `kernel` packages.
+The dry-run summary shows compliant, non-compliant, and unknown server counts. A server is `NOT COMPLIANT` when it has more than one installed kernel or at least one RHSA update available. It is `COMPLIANT` only when both inventories were collected, no RHSA updates are available, and no more than one kernel is installed. Installed kernel inventory uses `kernel-core` packages when present and falls back to `kernel` packages.
 
-Long RHSA Available To Install lists are collapsed by default in dry-run and patch reports. Select the “Show N advisories” control to expand a server's complete list.
+Dry-run reports include a copy-friendly list and table of non-compliant server IPs before the detailed server status table. Long All Installed RHSA lists are collapsed by default in dry-run and patch reports; select “Show N advisories” to expand them. Installed-kernel lists remain visible without an expand control.
 
 To browse reports from the app, open:
 

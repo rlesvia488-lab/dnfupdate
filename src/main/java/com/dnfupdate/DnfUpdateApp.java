@@ -1434,6 +1434,12 @@ public final class DnfUpdateApp {
                     ul { margin: 0; padding-left: 18px; }
                     details.expand-list summary { cursor: pointer; color: #1d4ed8; font-weight: 700; white-space: nowrap; }
                     details.expand-list[open] summary { margin-bottom: 8px; }
+                    .copy-panel { display: flex; gap: 10px; align-items: stretch; margin-bottom: 12px; }
+                    .copy-panel textarea { flex: 1; min-height: 76px; resize: vertical; padding: 10px; font: 14px Consolas, monospace; border: 1px solid #cbd5e1; border-radius: 6px; }
+                    .copy-panel button { align-self: flex-start; border: 0; border-radius: 6px; padding: 10px 14px; color: #fff; background: #1d4ed8; cursor: pointer; font-weight: 700; }
+                    .compliant { color: #15803d; font-weight: 700; }
+                    .not-compliant { color: #b91c1c; font-weight: 700; }
+                    .unknown { color: #a16207; font-weight: 700; }
                     .success { color: #15803d; font-weight: 700; }
                     .failed { color: #b91c1c; font-weight: 700; }
                     .running, .queued { color: #1d4ed8; font-weight: 700; }
@@ -1457,23 +1463,49 @@ public final class DnfUpdateApp {
                 .append("</div>")
                 .append("</div>");
 
-        long serversWithUpdates = job.hosts.stream()
-                .map(job::reportFor)
-                .filter(report -> !report.rhsaPresentBefore.isEmpty())
-                .count();
         html.append("<div class=\"summary grid\">")
-                .append(stat("Total", job.hosts.size()))
-                .append(stat("Succeeded", job.succeeded.get()))
-                .append(stat("Failed", job.failed.get()))
-                .append(job.settings.dryRun
-                        ? stat("Servers With Updates", Long.toString(serversWithUpdates))
-                        : stat("Reboot Requested", job.settings.reboot ? "Yes" : "No"))
-                .append("</div>");
+                .append(stat("Total", job.hosts.size()));
+        if (job.settings.dryRun) {
+            long compliantCount = job.hosts.stream().map(job::reportFor)
+                    .filter(report -> "COMPLIANT".equals(complianceStatus(report))).count();
+            long nonCompliantCount = job.hosts.stream().map(job::reportFor)
+                    .filter(report -> "NOT COMPLIANT".equals(complianceStatus(report))).count();
+            long unknownCount = job.hosts.size() - compliantCount - nonCompliantCount;
+            html.append(stat("Compliant", Long.toString(compliantCount)))
+                    .append(stat("Not Compliant", Long.toString(nonCompliantCount)))
+                    .append(stat("Unknown", Long.toString(unknownCount)));
+        } else {
+            html.append(stat("Succeeded", job.succeeded.get()))
+                    .append(stat("Failed", job.failed.get()))
+                    .append(stat("Reboot Requested", job.settings.reboot ? "Yes" : "No"));
+        }
+        html.append("</div>");
+
+        if (job.settings.dryRun) {
+            List<String> nonCompliantHosts = job.hosts.stream()
+                    .filter(host -> "NOT COMPLIANT".equals(complianceStatus(job.reportFor(host))))
+                    .sorted()
+                    .toList();
+            html.append("<h2>Non-Compliant Server IPs</h2>");
+            if (nonCompliantHosts.isEmpty()) {
+                html.append("<div class=\"meta empty\">No non-compliant servers were found.</div>");
+            } else {
+                String ipList = String.join("\n", nonCompliantHosts);
+                html.append("<div class=\"copy-panel\">")
+                        .append("<textarea id=\"nonCompliantIps\" readonly>").append(escapeHtml(ipList)).append("</textarea>")
+                        .append("<button type=\"button\" onclick=\"copyNonCompliantIps()\">Copy all IPs</button>")
+                        .append("</div><table><thead><tr><th>IP / Hostname</th></tr></thead><tbody>");
+                for (String host : nonCompliantHosts) {
+                    html.append("<tr><td>").append(escapeHtml(host)).append("</td></tr>");
+                }
+                html.append("</tbody></table>");
+            }
+        }
 
         html.append("<h2>Server Status And RHSA</h2>");
         html.append("<table><thead><tr>");
         if (job.settings.dryRun) {
-            html.append("<th>Server</th><th>Status</th><th>Security Updates Available</th><th>Installed Kernel Count</th><th>Installed Kernels</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
+            html.append("<th>Server</th><th>Status</th><th>Compliance</th><th>Compliance Reason</th><th>Security Updates Available</th><th>Installed Kernel Count</th><th>Installed Kernels</th><th>RHSA Available To Install</th><th>All Installed RHSA In The OS</th>");
         } else if (job.settings.reboot) {
             html.append("<th>Server</th><th>Status</th><th>RHSA Available To Install</th><th>RHSA Corrected By This Run</th><th>All Installed RHSA In The OS</th><th>Machine After Reboot</th><th>Service After Reboot</th><th>Working Healthcheck</th>");
         } else {
@@ -1489,18 +1521,22 @@ public final class DnfUpdateApp {
                     .append("<td>").append(escapeHtml(host)).append("</td>")
                     .append("<td class=\"").append(escapeHtml(status)).append("\">").append(escapeHtml(status)).append("</td>");
             if (job.settings.dryRun) {
-                html.append(availabilityCell(report.securityInventoryCollected
+                String compliance = complianceStatus(report);
+                html.append("<td class=\"").append(complianceCss(compliance)).append("\">")
+                        .append(escapeHtml(compliance)).append("</td>")
+                        .append("<td>").append(escapeHtml(complianceReason(report))).append("</td>")
+                        .append(availabilityCell(report.securityInventoryCollected
                                 ? !report.rhsaPresentBefore.isEmpty() : null))
                         .append("<td>").append(report.kernelInventoryCollected ? report.installedKernels.size() : "UNKNOWN").append("</td>")
                         .append("<td>").append(report.kernelInventoryCollected
-                                ? collapsibleList(report.installedKernels, "kernel", "kernels")
+                                ? valueList(report.installedKernels)
                                 : "<span class=\"empty\">Unable to determine</span>").append("</td>");
             }
-            html.append("<td>").append(collapsibleAdvisoryList(report.rhsaPresentBefore)).append("</td>");
+            html.append("<td>").append(advisoryList(report.rhsaPresentBefore)).append("</td>");
             if (!job.settings.dryRun) {
                 html.append("<td>").append(advisoryList(report.rhsaCorrected)).append("</td>");
             }
-            html.append("<td>").append(advisoryList(report.rhsaInstalledAfter)).append("</td>");
+            html.append("<td>").append(collapsibleAdvisoryList(report.rhsaInstalledAfter)).append("</td>");
             if (!job.settings.dryRun && job.settings.reboot) {
                 html.append(statusCell(report.machineUpAfterReboot == null ? "UNKNOWN" : report.machineUpAfterReboot ? "UP" : "DOWN"))
                         .append(statusCell(report.serviceUpAfterReboot == null ? "UNKNOWN" : report.serviceUpAfterReboot ? "UP" : "DOWN"))
@@ -1511,6 +1547,18 @@ public final class DnfUpdateApp {
         html.append("</tbody></table>");
         html.append("""
                 </main>
+                <script>
+                  async function copyNonCompliantIps() {
+                    const field = document.getElementById('nonCompliantIps');
+                    if (!field) return;
+                    try {
+                      await navigator.clipboard.writeText(field.value);
+                    } catch (error) {
+                      field.select();
+                      document.execCommand('copy');
+                    }
+                  }
+                </script>
                 </body>
                 </html>
                 """);
@@ -1809,17 +1857,7 @@ public final class DnfUpdateApp {
     }
 
     private static String advisoryList(Set<String> advisories) {
-        if (advisories.isEmpty()) {
-            return "<span class=\"empty\">None recorded</span>";
-        }
-        StringBuilder html = new StringBuilder("<ul>");
-        synchronized (advisories) {
-            for (String advisory : advisories) {
-                html.append("<li>").append(escapeHtml(advisory)).append("</li>");
-            }
-        }
-        html.append("</ul>");
-        return html.toString();
+        return valueList(advisories);
     }
 
     private static String collapsibleAdvisoryList(Set<String> advisories) {
@@ -1840,6 +1878,55 @@ public final class DnfUpdateApp {
         }
         html.append("</ul></details>");
         return html.toString();
+    }
+
+    private static String valueList(Set<String> values) {
+        if (values.isEmpty()) {
+            return "<span class=\"empty\">None recorded</span>";
+        }
+        StringBuilder html = new StringBuilder("<ul>");
+        synchronized (values) {
+            for (String value : values) {
+                html.append("<li>").append(escapeHtml(value)).append("</li>");
+            }
+        }
+        html.append("</ul>");
+        return html.toString();
+    }
+
+    private static String complianceStatus(HostReport report) {
+        if (report.installedKernels.size() > 1 || !report.rhsaPresentBefore.isEmpty()) {
+            return "NOT COMPLIANT";
+        }
+        if (report.kernelInventoryCollected && report.securityInventoryCollected) {
+            return "COMPLIANT";
+        }
+        return "UNKNOWN";
+    }
+
+    private static String complianceReason(HostReport report) {
+        List<String> reasons = new ArrayList<>();
+        if (report.installedKernels.size() > 1) {
+            reasons.add(report.installedKernels.size() + " installed kernels");
+        }
+        if (!report.rhsaPresentBefore.isEmpty()) {
+            reasons.add(report.rhsaPresentBefore.size() + " RHSA updates available");
+        }
+        if (!reasons.isEmpty()) {
+            return String.join("; ", reasons);
+        }
+        if (!report.kernelInventoryCollected || !report.securityInventoryCollected) {
+            return "Inventory could not be fully collected";
+        }
+        return "One or fewer installed kernels and no RHSA updates available";
+    }
+
+    private static String complianceCss(String status) {
+        return switch (status) {
+            case "COMPLIANT" -> "compliant";
+            case "NOT COMPLIANT" -> "not-compliant";
+            default -> "unknown";
+        };
     }
 
     private static Map<String, String> readForm(HttpExchange exchange) throws IOException {
