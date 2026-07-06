@@ -682,8 +682,13 @@ public final class DnfUpdateApp {
 
     private List<String> fetchActiveServerIps(String accessToken, OcsEndpoint endpoint, List<String> warnings)
             throws IOException, InterruptedException {
-        Object parsed = getOcsJson(appendQueryParam(endpoint.serversUrl(), "status", "ACTIVE"), accessToken, endpoint);
         List<String> ips = new ArrayList<>();
+        if (endpoint.fetchIpsUrl().isBlank()) {
+            warnings.add("OCS endpoint " + endpoint.name()
+                    + " has no ocs_fetch_ips_url configured in the Vault technical accounts secret.");
+            return ips;
+        }
+        Object parsed = getOcsJson(appendQueryParam(endpoint.fetchIpsUrl(), "status", "ACTIVE"), accessToken, endpoint);
         if (!(parsed instanceof Map<?, ?> root) || !(root.get("servers") instanceof Collection<?> servers)) {
             warnings.add("OCS endpoint " + endpoint.name() + " returned no server list.");
             return ips;
@@ -697,7 +702,7 @@ public final class DnfUpdateApp {
             String ip = serverIp(server);
             if (ip.isBlank() && !id.isBlank()) {
                 try {
-                    Object detail = getOcsJson(serverDetailUrl(endpoint.serversUrl(), server, id), accessToken, endpoint);
+                    Object detail = getOcsJson(serverDetailUrl(endpoint.fetchIpsUrl(), server, id), accessToken, endpoint);
                     Object payload = detail instanceof Map<?, ?> detailRoot && detailRoot.get("server") instanceof Map<?, ?> nested
                             ? nested
                             : detail;
@@ -795,6 +800,9 @@ public final class DnfUpdateApp {
         }
         while (base.endsWith("/")) {
             base = base.substring(0, base.length() - 1);
+        }
+        if (base.toLowerCase(Locale.ROOT).endsWith("/detail")) {
+            base = base.substring(0, base.length() - "/detail".length());
         }
         return base + "/" + urlPathEncode(serverId);
     }
@@ -1323,11 +1331,12 @@ public final class DnfUpdateApp {
         if (value instanceof Map<?, ?> map) {
             String serversUrl = firstNonBlank(map, "ocs_servers_url", "ocsServersUrl", "servers_url", "serversUrl");
             String actionUrl = firstNonBlank(map, "ocs_server_action_url", "ocsServerActionUrl", "server_action_url", "serverActionUrl");
+            String fetchIpsUrl = firstNonBlank(map, "ocs_fetch_ips_url", "ocsFetchIpsUrl", "fetch_ips_url", "fetchIpsUrl");
             if (!serversUrl.isBlank() && !actionUrl.isBlank()) {
                 String key = serversUrl + "\n" + actionUrl;
                 if (seen.add(key)) {
                     String name = firstNonBlank(map, "region", "name", "location");
-                    endpoints.add(new OcsEndpoint(name.isBlank() ? "default" : name, serversUrl, actionUrl));
+                    endpoints.add(new OcsEndpoint(name.isBlank() ? "default" : name, serversUrl, actionUrl, fetchIpsUrl));
                 }
             }
             for (Object nested : map.values()) {
@@ -2359,7 +2368,7 @@ public final class DnfUpdateApp {
     private record CloudServer(String id, String name, String accessIPv4) {
     }
 
-    private record OcsEndpoint(String name, String serversUrl, String actionUrl) {
+    private record OcsEndpoint(String name, String serversUrl, String actionUrl, String fetchIpsUrl) {
     }
 
     private record CloudRecoveryConfig(
