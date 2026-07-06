@@ -142,6 +142,7 @@ public final class DnfUpdateApp {
         server.createContext("/", app::handleIndex);
         server.createContext("/api/start", app::handleStart);
         server.createContext("/api/technical-accounts", app::handleTechnicalAccounts);
+        server.createContext("/api/fetch-ips", app::handleFetchIps);
         server.createContext("/api/job", app::handleJob);
         server.setExecutor(Executors.newCachedThreadPool());
         server.start();
@@ -585,6 +586,217 @@ public final class DnfUpdateApp {
             send(exchange, 503, "application/json", "{\"error\":\"Unable to load Vault technical accounts: "
                     + escapeJson(cleanMessage(e)) + "\"}");
         }
+    }
+
+    private void handleFetchIps(HttpExchange exchange) throws IOException {
+        if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            send(exchange, 405, "application/json", "{\"error\":\"Method not allowed\"}");
+            return;
+        }
+        Map<String, String> form = readForm(exchange);
+        String technicalAccountName = form.getOrDefault("technicalAccount", "").trim();
+        if (technicalAccountName.isBlank()) {
+            send(exchange, 400, "application/json", "{\"error\":\"Select a Vault technical account first.\"}");
+            return;
+        }
+        Set<String> regions = new LinkedHashSet<>();
+        if ("on".equals(form.get("regionParis"))) {
+            regions.add("paris");
+        }
+        if ("on".equals(form.get("regionNorth"))) {
+            regions.add("north");
+        }
+        if (regions.isEmpty()) {
+            send(exchange, 400, "application/json", "{\"error\":\"Select at least one region (Paris or North).\"}");
+            return;
+        }
+        try {
+            CloudRecoveryConfig recoveryConfig = loadCloudRecoveryConfig(vaultStatus.config());
+            Optional<TechnicalAccount> account = findTechnicalAccount(recoveryConfig, technicalAccountName);
+            if (account.isEmpty()) {
+                send(exchange, 400, "application/json", "{\"error\":\"The selected Vault technical account is not available. Refresh the page and try again.\"}");
+                return;
+            }
+            if (!recoveryConfig.isComplete()) {
+                send(exchange, 503, "application/json", "{\"error\":\"Cloud API URLs are missing from Vault secret "
+                        + escapeJson(vaultStatus.config().technicalAccountsPath()) + ".\"}");
+                return;
+            }
+            List<OcsEndpoint> selectedEndpoints = recoveryConfig.ocsEndpoints().stream()
+                    .filter(endpoint -> matchesRegion(endpoint.name(), regions))
+                    .toList();
+            if (selectedEndpoints.isEmpty()) {
+                String available = String.join(", ",
+                        recoveryConfig.ocsEndpoints().stream().map(OcsEndpoint::name).toList());
+                send(exchange, 400, "application/json", "{\"error\":\"No OCS endpoint matched the selected region(s). Available endpoints: "
+                        + escapeJson(available.isBlank() ? "none" : available) + ".\"}");
+                return;
+            }
+            String accessToken = requestCmaasToken(account.get(), recoveryConfig);
+            Set<String> ips = new LinkedHashSet<>();
+            List<String> warnings = new ArrayList<>();
+            for (OcsEndpoint endpoint : selectedEndpoints) {
+                try {
+                    ips.addAll(fetchActiveServerIps(accessToken, endpoint, warnings));
+                } catch (InterruptedException e) {
+                    throw e;
+                } catch (Exception e) {
+                    warnings.add("OCS endpoint " + endpoint.name() + " failed: " + cleanMessage(e));
+                }
+            }
+            StringBuilder json = new StringBuilder("{\"ips\":[");
+            int index = 0;
+            for (String ip : ips) {
+                if (index++ > 0) {
+                    json.append(',');
+                }
+                json.append('"').append(escapeJson(ip)).append('"');
+            }
+            json.append("],\"warnings\":[");
+            for (int i = 0; i < warnings.size(); i++) {
+                if (i > 0) {
+                    json.append(',');
+                }
+                json.append('"').append(escapeJson(warnings.get(i))).append('"');
+            }
+            json.append("]}");
+            send(exchange, 200, "application/json", json.toString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            send(exchange, 503, "application/json", "{\"error\":\"Fetching server IPs was interrupted.\"}");
+        } catch (Exception e) {
+            send(exchange, 503, "application/json", "{\"error\":\"Unable to fetch server IPs: "
+                    + escapeJson(cleanMessage(e)) + "\"}");
+        }
+    }
+
+    private static boolean matchesRegion(String endpointName, Set<String> regions) {
+        String name = endpointName == null ? "" : endpointName.toLowerCase(Locale.ROOT);
+        for (String region : regions) {
+            if (name.contains(region)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<String> fetchActiveServerIps(String accessToken, OcsEndpoint endpoint, List<String> warnings)
+            throws IOException, InterruptedException {
+        Object parsed = getOcsJson(appendQueryParam(endpoint.serversUrl(), "status", "ACTIVE"), accessToken, endpoint);
+        List<String> ips = new ArrayList<>();
+        if (!(parsed instanceof Map<?, ?> root) || !(root.get("servers") instanceof Collection<?> servers)) {
+            warnings.add("OCS endpoint " + endpoint.name() + " returned no server list.");
+            return ips;
+        }
+        for (Object item : servers) {
+            if (!(item instanceof Map<?, ?> server)) {
+                continue;
+            }
+            String id = stringValue(server.get("id"));
+            String name = stringValue(server.get("name"));
+            String ip = serverIp(server);
+            if (ip.isBlank() && !id.isBlank()) {
+                try {
+                    Object detail = getOcsJson(serverDetailUrl(endpoint.serversUrl(), server, id), accessToken, endpoint);
+                    Object payload = detail instanceof Map<?, ?> detailRoot && detailRoot.get("server") instanceof Map<?, ?> nested
+                            ? nested
+                            : detail;
+                    if (payload instanceof Map<?, ?> serverDetail) {
+                        ip = serverIp(serverDetail);
+                    }
+                } catch (InterruptedException e) {
+                    throw e;
+                } catch (Exception e) {
+                    warnings.add("Unable to read details of server " + (name.isBlank() ? id : name)
+                            + " in " + endpoint.name() + ": " + cleanMessage(e));
+                    continue;
+                }
+            }
+            if (ip.isBlank()) {
+                warnings.add("No IPv4 address found for server " + (name.isBlank() ? id : name)
+                        + " in " + endpoint.name() + ".");
+            } else {
+                ips.add(ip);
+            }
+        }
+        return ips;
+    }
+
+    private static String serverIp(Map<?, ?> server) {
+        String accessIp = stringValue(server.get("accessIPv4"));
+        if (!accessIp.isBlank()) {
+            return accessIp;
+        }
+        List<String> collected = new ArrayList<>();
+        collectIpv4Addresses(server.get("addresses"), collected);
+        return collected.isEmpty() ? "" : collected.get(0);
+    }
+
+    private static void collectIpv4Addresses(Object value, List<String> out) {
+        if (value instanceof Map<?, ?> map) {
+            String addr = stringValue(map.get("addr"));
+            if (!addr.isBlank()) {
+                String version = stringValue(map.get("version"));
+                if (version.isBlank() || "4".equals(version)) {
+                    out.add(addr);
+                }
+            }
+            for (Object nested : map.values()) {
+                collectIpv4Addresses(nested, out);
+            }
+        } else if (value instanceof Collection<?> collection) {
+            for (Object nested : collection) {
+                collectIpv4Addresses(nested, out);
+            }
+        }
+    }
+
+    private Object getOcsJson(String url, String accessToken, OcsEndpoint endpoint) throws IOException, InterruptedException {
+        appendDebugLog("HTTP REQUEST", "GET " + url + " endpoint=" + endpoint.name()
+                + " headers={Authorization=Bearer [REDACTED], Accept=application/json}");
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMillis(15000))
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + accessToken)
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        appendDebugLog("HTTP RESPONSE", "GET " + url + " endpoint=" + endpoint.name()
+                + " status=" + response.statusCode() + " body=" + response.body());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("OCS request failed with HTTP " + response.statusCode());
+        }
+        return new JsonParser(response.body()).parse();
+    }
+
+    private static String appendQueryParam(String url, String name, String value) {
+        String clean = url.trim();
+        if (clean.toLowerCase(Locale.ROOT).contains(name.toLowerCase(Locale.ROOT) + "=")) {
+            return clean;
+        }
+        return clean + (clean.contains("?") ? "&" : "?") + name + "="
+                + URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    private static String serverDetailUrl(String serversUrl, Map<?, ?> server, String serverId) {
+        if (server.get("links") instanceof Collection<?> links) {
+            for (Object linkItem : links) {
+                if (linkItem instanceof Map<?, ?> link
+                        && "self".equalsIgnoreCase(stringValue(link.get("rel")))
+                        && !stringValue(link.get("href")).isBlank()) {
+                    return stringValue(link.get("href"));
+                }
+            }
+        }
+        String base = serversUrl.trim();
+        int queryStart = base.indexOf('?');
+        if (queryStart >= 0) {
+            base = base.substring(0, queryStart);
+        }
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base + "/" + urlPathEncode(serverId);
     }
 
     private void handleJob(HttpExchange exchange) throws IOException {
@@ -2605,6 +2817,22 @@ public final class DnfUpdateApp {
                       width: 18px;
                       height: 18px;
                     }
+                    .fetch-row {
+                      display: flex;
+                      align-items: center;
+                      gap: 12px;
+                      margin-top: 8px;
+                    }
+                    .fetch-row .check {
+                      padding: 0;
+                      white-space: nowrap;
+                    }
+                    .fetch-row button {
+                      width: auto;
+                      padding: 9px 12px;
+                      background: #334155;
+                      font-weight: 700;
+                    }
                     button {
                       width: 100%;
                       border: 0;
@@ -2717,6 +2945,12 @@ public final class DnfUpdateApp {
                           <label for="hosts">Servers</label>
                           <textarea id="hosts" name="hosts" placeholder="10.0.1.10&#10;10.0.1.11"></textarea>
                           <div class="muted">One IP or hostname per line. Lines starting with # are ignored.</div>
+                          <div class="fetch-row">
+                            <label class="check"><input id="regionParis" type="checkbox" checked> Paris</label>
+                            <label class="check"><input id="regionNorth" type="checkbox"> North</label>
+                            <button id="fetchIpsButton" type="button">Fetch IPs</button>
+                          </div>
+                          <div id="fetchIpsHelp" class="muted">Fetches ACTIVE server IPs from OCS with the selected technical account.</div>
                         </div>
                         <div class="grid2">
                           <div class="field">
@@ -2817,6 +3051,49 @@ public final class DnfUpdateApp {
                     }
 
                     loadTechnicalAccounts();
+
+                    const hostsField = document.getElementById('hosts');
+                    const fetchIpsButton = document.getElementById('fetchIpsButton');
+                    const fetchIpsHelp = document.getElementById('fetchIpsHelp');
+                    const regionParis = document.getElementById('regionParis');
+                    const regionNorth = document.getElementById('regionNorth');
+
+                    fetchIpsButton.addEventListener('click', async () => {
+                      if (!technicalAccount.value) {
+                        fetchIpsHelp.textContent = 'Select a Vault technical account first.';
+                        return;
+                      }
+                      if (!regionParis.checked && !regionNorth.checked) {
+                        fetchIpsHelp.textContent = 'Select at least one region (Paris or North).';
+                        return;
+                      }
+                      fetchIpsButton.disabled = true;
+                      fetchIpsButton.textContent = 'Fetching...';
+                      fetchIpsHelp.textContent = 'Fetching ACTIVE server IPs from the cloud API...';
+                      try {
+                        const params = new URLSearchParams();
+                        params.set('technicalAccount', technicalAccount.value);
+                        if (regionParis.checked) params.set('regionParis', 'on');
+                        if (regionNorth.checked) params.set('regionNorth', 'on');
+                        const response = await fetch('/api/fetch-ips', { method: 'POST', body: params });
+                        const data = await readJsonResponse(response);
+                        if (!response.ok) throw new Error(data.error || 'Unable to fetch server IPs.');
+                        const fetched = data.ips || [];
+                        const existing = hostsField.value.split(/\\r?\\n/).map(line => line.trim()).filter(line => line);
+                        const merged = existing.concat(fetched.filter(ip => !existing.includes(ip)));
+                        hostsField.value = merged.join('\\n');
+                        let message = `Fetched ${fetched.length} IP(s); added ${merged.length - existing.length} new to the server list.`;
+                        if ((data.warnings || []).length > 0) {
+                          message += ` Warnings: ${data.warnings.join(' ')}`;
+                        }
+                        fetchIpsHelp.textContent = message;
+                      } catch (error) {
+                        fetchIpsHelp.textContent = error.message;
+                      } finally {
+                        fetchIpsButton.disabled = false;
+                        fetchIpsButton.textContent = 'Fetch IPs';
+                      }
+                    });
 
                     dryRun.addEventListener('change', () => {
                       runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';
