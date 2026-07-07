@@ -3010,6 +3010,101 @@ public final class DnfUpdateApp {
                       font-size: 13px;
                       line-height: 1.45;
                     }
+                    .logtabs {
+                      display: flex;
+                      gap: 8px;
+                      padding: 10px 14px 0;
+                    }
+                    .logtabs button {
+                      width: auto;
+                      padding: 7px 12px;
+                      background: #e2e8f0;
+                      color: var(--ink);
+                      border: 1px solid var(--line);
+                      font-weight: 700;
+                    }
+                    .logtabs button.active {
+                      background: var(--blue);
+                      color: #fff;
+                      border-color: var(--blue);
+                    }
+                    .logtabs input {
+                      width: 220px;
+                      margin-left: auto;
+                      padding: 7px 10px;
+                    }
+                    .hostlogs {
+                      height: 590px;
+                      overflow: auto;
+                      padding: 12px 14px;
+                      display: grid;
+                      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+                      gap: 12px;
+                      align-content: start;
+                    }
+                    .hostpanel {
+                      border: 1px solid var(--line);
+                      border-radius: 8px;
+                      display: flex;
+                      flex-direction: column;
+                      min-width: 0;
+                      background: #fff;
+                    }
+                    .hostpanel h3 {
+                      margin: 0;
+                      padding: 8px 10px;
+                      font-size: 13px;
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      gap: 8px;
+                      border-bottom: 1px solid var(--line);
+                    }
+                    .hostpanel h3 .htitle {
+                      overflow: hidden;
+                      text-overflow: ellipsis;
+                      white-space: nowrap;
+                      font-family: var(--mono);
+                      font-size: 12px;
+                    }
+                    .hostpanel h3 .badges {
+                      display: flex;
+                      gap: 6px;
+                      align-items: center;
+                      flex-shrink: 0;
+                    }
+                    .hostpanel h3 .pstatus {
+                      font-size: 11px;
+                      font-weight: 700;
+                      text-transform: uppercase;
+                    }
+                    .hostpanel h3 .perr {
+                      color: #fff;
+                      background: var(--red);
+                      border-radius: 999px;
+                      padding: 1px 7px;
+                      font-size: 11px;
+                      font-weight: 700;
+                    }
+                    .hostpanel.queued h3 { color: var(--muted); }
+                    .hostpanel.running h3 { color: var(--blue); }
+                    .hostpanel.running { border-color: var(--blue); }
+                    .hostpanel.success h3 { color: var(--green); }
+                    .hostpanel.success { border-color: var(--green); }
+                    .hostpanel.failed h3 { color: var(--red); }
+                    .hostpanel.failed { border-color: var(--red); }
+                    .plog {
+                      height: 200px;
+                      overflow: auto;
+                      background: #101820;
+                      color: #e5edf5;
+                      font-family: var(--mono);
+                      font-size: 12px;
+                      line-height: 1.45;
+                      padding: 8px;
+                      border-radius: 0 0 8px 8px;
+                    }
+                    .hidden { display: none; }
                     .line {
                       white-space: pre-wrap;
                       overflow-wrap: anywhere;
@@ -3025,6 +3120,7 @@ public final class DnfUpdateApp {
                     @media (max-width: 880px) {
                       main.wrap { grid-template-columns: 1fr; }
                       .statusbar { grid-template-columns: repeat(2, 1fr); }
+                      .hostlogs { grid-template-columns: 1fr; }
                       header .wrap { align-items: flex-start; flex-direction: column; justify-content: center; padding: 12px 0; }
                     }
                   </style>
@@ -3111,7 +3207,13 @@ public final class DnfUpdateApp {
                         <div class="stat"><b id="failed">0</b><span>Failed</span></div>
                       </div>
                       <div id="hostsView" class="hosts"></div>
-                      <div id="logs" class="logs" aria-live="polite"></div>
+                      <div class="logtabs">
+                        <button type="button" id="viewPerHost" class="active">Per server</button>
+                        <button type="button" id="viewCombined">Combined</button>
+                        <input id="hostFilter" type="search" placeholder="Filter servers..." autocomplete="off">
+                      </div>
+                      <div id="hostLogs" class="hostlogs" aria-live="polite"></div>
+                      <div id="logs" class="logs hidden" aria-live="polite"></div>
                     </section>
                   </main>
                   <script>
@@ -3213,12 +3315,86 @@ public final class DnfUpdateApp {
                       runButton.textContent = dryRun.checked ? 'Start Dry Run' : 'Start Update';
                     });
 
-                    function appendLine(event) {
+                    const hostLogs = document.getElementById('hostLogs');
+                    const viewPerHost = document.getElementById('viewPerHost');
+                    const viewCombined = document.getElementById('viewCombined');
+                    const hostFilter = document.getElementById('hostFilter');
+                    const hostPanels = new Map();
+                    const MAX_PANEL_LINES = 400;
+                    const MAX_COMBINED_LINES = 4000;
+                    const STATUS_CLASSES = ['queued', 'running', 'success', 'failed'];
+
+                    function setLogView(perHost) {
+                      hostLogs.classList.toggle('hidden', !perHost);
+                      logs.classList.toggle('hidden', perHost);
+                      viewPerHost.classList.toggle('active', perHost);
+                      viewCombined.classList.toggle('active', !perHost);
+                      if (perHost) {
+                        hostPanels.forEach(panel => { panel.body.scrollTop = panel.body.scrollHeight; });
+                      } else {
+                        logs.scrollTop = logs.scrollHeight;
+                      }
+                    }
+                    viewPerHost.addEventListener('click', () => setLogView(true));
+                    viewCombined.addEventListener('click', () => setLogView(false));
+
+                    function applyHostFilterTo(panel, host) {
+                      const needle = hostFilter.value.trim().toLowerCase();
+                      panel.box.classList.toggle('hidden', needle !== '' && !host.toLowerCase().includes(needle));
+                    }
+                    hostFilter.addEventListener('input', () => hostPanels.forEach(applyHostFilterTo));
+
+                    function panelFor(host) {
+                      let panel = hostPanels.get(host);
+                      if (!panel) {
+                        const box = document.createElement('div');
+                        box.className = 'hostpanel';
+                        box.dataset.host = host;
+                        const title = document.createElement('h3');
+                        title.innerHTML = `<span class="htitle">${escapeHtml(host)}</span>`
+                            + '<span class="badges"><span class="perr hidden"></span><span class="pstatus"></span></span>';
+                        const body = document.createElement('div');
+                        body.className = 'plog';
+                        box.appendChild(title);
+                        box.appendChild(body);
+                        const after = [...hostLogs.children].find(other => other.dataset.host !== 'system'
+                            && other.dataset.host.localeCompare(host, undefined, { numeric: true }) > 0);
+                        hostLogs.insertBefore(box, host === 'system' ? hostLogs.firstChild : (after || null));
+                        panel = { box, body, errors: 0, errBadge: title.querySelector('.perr'), status: title.querySelector('.pstatus') };
+                        hostPanels.set(host, panel);
+                        applyHostFilterTo(panel, host);
+                      }
+                      return panel;
+                    }
+
+                    function renderLine(event, withHost) {
                       const row = document.createElement('div');
                       row.className = 'line';
-                      row.innerHTML = `<span class="time">[${escapeHtml(event.time)}]</span> <span class="host">${escapeHtml(event.host)}</span> <span class="${escapeHtml(event.level)}">${escapeHtml(event.level.toUpperCase())}</span> ${escapeHtml(event.message)}`;
-                      logs.appendChild(row);
-                      logs.scrollTop = logs.scrollHeight;
+                      const hostPart = withHost ? ` <span class="host">${escapeHtml(event.host)}</span>` : '';
+                      row.innerHTML = `<span class="time">[${escapeHtml(event.time)}]</span>${hostPart} <span class="${escapeHtml(event.level)}">${escapeHtml(event.level.toUpperCase())}</span> ${escapeHtml(event.message)}`;
+                      return row;
+                    }
+
+                    function appendPinned(container, row, maxLines) {
+                      const pinned = container.scrollTop + container.clientHeight >= container.scrollHeight - 40;
+                      container.appendChild(row);
+                      while (container.childElementCount > maxLines) {
+                        container.firstElementChild.remove();
+                      }
+                      if (pinned) {
+                        container.scrollTop = container.scrollHeight;
+                      }
+                    }
+
+                    function appendLine(event) {
+                      appendPinned(logs, renderLine(event, true), MAX_COMBINED_LINES);
+                      const panel = panelFor(event.host || 'system');
+                      appendPinned(panel.body, renderLine(event, false), MAX_PANEL_LINES);
+                      if (event.level === 'error') {
+                        panel.errors++;
+                        panel.errBadge.textContent = panel.errors + (panel.errors === 1 ? ' error' : ' errors');
+                        panel.errBadge.classList.remove('hidden');
+                      }
                     }
 
                     function updateSummary(job) {
@@ -3233,6 +3409,12 @@ public final class DnfUpdateApp {
                         pill.className = `pill ${statuses[host]}`;
                         pill.textContent = `${host} · ${statuses[host]}`;
                         hostsView.appendChild(pill);
+                        const panel = panelFor(host);
+                        STATUS_CLASSES.forEach(cls => panel.box.classList.remove(cls));
+                        if (STATUS_CLASSES.includes(statuses[host])) {
+                          panel.box.classList.add(statuses[host]);
+                        }
+                        panel.status.textContent = statuses[host];
                       });
                     }
 
@@ -3247,6 +3429,8 @@ public final class DnfUpdateApp {
                       if (source) source.close();
                       logs.innerHTML = '';
                       hostsView.innerHTML = '';
+                      hostLogs.innerHTML = '';
+                      hostPanels.clear();
                       runButton.disabled = true;
                       runButton.textContent = dryRun.checked ? 'Dry Run Running...' : 'Running...';
                       try {
