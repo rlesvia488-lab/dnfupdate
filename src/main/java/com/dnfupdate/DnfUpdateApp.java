@@ -75,6 +75,8 @@ public final class DnfUpdateApp {
     private static final long DEBUG_LOG_MAX_BYTES = 50L * 1024 * 1024;
     private static final int DEBUG_LOG_BACKUPS = 5;
     private static final Pattern RHSA_PATTERN = Pattern.compile("\\bRHSA-\\d{4}:\\d+\\b");
+    private static final Pattern LISTEN_PORT_PATTERN = Pattern.compile(".*:(\\d+)$");
+    private static final int EPHEMERAL_PORT_START = 32768;
     private static final Pattern SENSITIVE_JSON_PATTERN = Pattern.compile(
             "(?i)(\\\"(?:access_token|refresh_token|client_token|client_secret|client-secret|clientSecret|secret_id|secret-id|secretId|role_id|role-id|roleId|accessor|password|token)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")");
     private static final Pattern AUTHORIZATION_PATTERN = Pattern.compile(
@@ -473,6 +475,7 @@ public final class DnfUpdateApp {
                 "on".equals(form.get("makecache")),
                 "on".equals(form.get("skipBroken")),
                 "on".equals(form.get("dryRun")),
+                "on".equals(form.get("lenientHealth")),
                 technicalAccountName
         );
 
@@ -964,12 +967,18 @@ public final class DnfUpdateApp {
             if (job.settings.reboot) {
                 runRemote(job, host, session, "sudo -n dnf -y remove --oldinstallonly");
                 String bootIdBefore = readBootId(job, host, session);
+                Set<Integer> portsBefore = readListeningPorts(job, host, session);
+                if (portsBefore.isEmpty()) {
+                    job.add(host, "warn", "Unable to record pre-reboot listening TCP ports; the port-restore fallback will be skipped.");
+                } else {
+                    job.add(host, "info", "Pre-reboot listening TCP ports recorded: " + joinPorts(portsBefore) + ".");
+                }
                 job.add(host, "info", "Reboot requested. SSH may disconnect now.");
                 job.add(host, "info", "After the reboot command is sent, the app will check SSH every 10 seconds for up to 5 minutes.");
                 runRemote(job, host, session, "sudo -n sh -c 'nohup sh -c \"sleep 2; systemctl reboot -i || reboot\" >/dev/null 2>&1 &'", true);
                 session.disconnect();
                 session = null;
-                PostRebootStatus status = verifyAfterReboot(job, host, report, bootIdBefore);
+                PostRebootStatus status = verifyAfterReboot(job, host, report, bootIdBefore, portsBefore);
                 try {
                     appendStatusLog(job, host, status);
                 } catch (IOException e) {
@@ -980,7 +989,7 @@ public final class DnfUpdateApp {
                     return;
                 }
                 if (!status.serviceUp()) {
-                    job.fail(host, "Update finished and server is reachable, but no configured health check returned HTTP 200 within 5 minutes.");
+                    job.fail(host, "Update finished and server is reachable, but no health check passed and the pre-reboot listening ports were not restored within 5 minutes.");
                     return;
                 }
                 job.succeed(host, "Update finished, reboot verified, and service is up via " + status.workingHealthcheck().orElse("unknown health check") + ".");
@@ -1008,7 +1017,7 @@ public final class DnfUpdateApp {
         return "";
     }
 
-    private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report, String bootIdBefore) {
+    private PostRebootStatus verifyAfterReboot(Job job, String host, HostReport report, String bootIdBefore, Set<Integer> portsBefore) {
         job.add(host, "info", "Starting post-reboot checks every 10 seconds for up to 5 minutes. SSH will only be accepted after the Linux boot ID changes.");
         SshWaitResult sshWait = waitForReboot(job, host, bootIdBefore, "Post-reboot SSH check attempt ");
         Session verificationSession = sshWait.session();
@@ -1051,7 +1060,7 @@ public final class DnfUpdateApp {
             runRemote(job, host, verificationSession, "sudo -n systemctl enable otelcol-contrib.service");
             runRemote(job, host, verificationSession, "sudo -n systemctl start otelcol-contrib.service");
 
-            Optional<String> workingHealthcheck = waitForHealthyService(job, host, verificationSession);
+            Optional<String> workingHealthcheck = waitForHealthyService(job, host, verificationSession, portsBefore);
             if (workingHealthcheck.isPresent()) {
                 report.serviceUpAfterReboot = true;
                 report.workingHealthcheck = workingHealthcheck.get();
@@ -1059,7 +1068,7 @@ public final class DnfUpdateApp {
             }
 
             report.serviceUpAfterReboot = false;
-            job.add(host, "error", "Server is reachable, but none of the configured health checks returned HTTP 200 within 5 minutes.");
+            job.add(host, "error", "Server is reachable, but no health check passed and the pre-reboot listening ports were not restored within 5 minutes.");
             return new PostRebootStatus(true, false, Optional.empty());
         } catch (Exception e) {
             report.machineUpAfterReboot = true;
@@ -1073,25 +1082,47 @@ public final class DnfUpdateApp {
         }
     }
 
-    private Optional<String> waitForHealthyService(Job job, String host, Session session) throws Exception {
+    private Optional<String> waitForHealthyService(Job job, String host, Session session, Set<Integer> portsBefore) throws Exception {
         long deadline = System.currentTimeMillis() + SERVICE_VERIFY_TIMEOUT_MILLIS;
         int attempt = 1;
-        job.add(host, "info", "Starting service health checks every 10 seconds for up to 5 minutes.");
+        boolean lenient = job.settings.lenientHealth;
+        job.add(host, "info", "Starting service health checks every 10 seconds for up to 5 minutes. "
+                + (lenient ? "Any HTTP response counts as service up." : "HTTP 2xx counts as service up."));
+        if (!portsBefore.isEmpty()) {
+            job.add(host, "info", "Fallback check: service also counts as up once all pre-reboot listening ports ("
+                    + joinPorts(portsBefore) + ") are restored.");
+        }
         while (System.currentTimeMillis() <= deadline) {
             job.add(host, "info", "Service health check attempt " + attempt + ".");
+            List<String> codesSeen = new ArrayList<>();
             for (String url : HEALTHCHECK_URLS) {
                 long requestTimeRemaining = deadline - System.currentTimeMillis();
                 if (requestTimeRemaining <= 0) {
                     return Optional.empty();
                 }
                 long curlTimeoutSeconds = Math.max(1L, Math.min(10L, (requestTimeRemaining + 999L) / 1000L));
-                String command = "curl -k -s -o /dev/null -w \"%{http_code}\" --max-time "
+                String command = "curl -k -s -L --noproxy '*' -o /dev/null -w \"%{http_code}\" --max-time "
                         + curlTimeoutSeconds + " " + shellQuote(url);
                 RemoteResult result = runRemote(job, host, session, command, true);
                 String statusCode = result.lines().isEmpty() ? "" : result.lines().get(result.lines().size() - 1).trim();
-                if ("200".equals(statusCode)) {
-                    job.add(host, "success", "Service health check returned HTTP 200: " + url);
-                    return Optional.of(url);
+                codesSeen.add(url.replaceFirst("^https?://127\\.0\\.0\\.1", "")
+                        + "=" + (statusCode.isBlank() ? "?" : statusCode));
+                if (isServiceUpCode(statusCode, lenient)) {
+                    job.add(host, "success", "Service health check passed with HTTP " + statusCode + ": " + url);
+                    return Optional.of(url + " (HTTP " + statusCode + ")");
+                }
+            }
+            job.add(host, "info", "No healthcheck URL passed this round: " + String.join(", ", codesSeen) + ".");
+            if (!portsBefore.isEmpty()) {
+                Set<Integer> portsNow = readListeningPorts(job, host, session);
+                if (!portsNow.isEmpty()) {
+                    Set<Integer> missing = new TreeSet<>(portsBefore);
+                    missing.removeAll(portsNow);
+                    if (missing.isEmpty()) {
+                        job.add(host, "success", "All pre-reboot listening ports are restored: " + joinPorts(portsBefore) + ".");
+                        return Optional.of("listening ports restored (" + joinPorts(portsBefore) + ")");
+                    }
+                    job.add(host, "info", "Still waiting for listening ports to be restored: " + joinPorts(missing) + ".");
                 }
             }
             long remaining = deadline - System.currentTimeMillis();
@@ -1103,6 +1134,57 @@ public final class DnfUpdateApp {
             attempt++;
         }
         return Optional.empty();
+    }
+
+    private static boolean isServiceUpCode(String statusCode, boolean lenient) {
+        int code;
+        try {
+            code = Integer.parseInt(statusCode.trim());
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (lenient) {
+            return code >= 100;
+        }
+        return code >= 200 && code < 300;
+    }
+
+    private Set<Integer> readListeningPorts(Job job, String host, Session session) {
+        try {
+            RemoteResult result = runRemote(job, host, session,
+                    "ss -tlnH 2>/dev/null || netstat -tln 2>/dev/null", true);
+            return parseListeningPorts(result.lines());
+        } catch (Exception e) {
+            job.add(host, "warn", "Unable to read listening TCP ports: " + cleanMessage(e));
+            return Set.of();
+        }
+    }
+
+    private static Set<Integer> parseListeningPorts(List<String> lines) {
+        Set<Integer> ports = new TreeSet<>();
+        for (String line : lines) {
+            for (String token : line.trim().split("\\s+")) {
+                Matcher matcher = LISTEN_PORT_PATTERN.matcher(token);
+                if (matcher.matches()) {
+                    try {
+                        int port = Integer.parseInt(matcher.group(1));
+                        // Ephemeral ports get a new number on every restart, so they can
+                        // never be "restored" and would make the comparison unsatisfiable.
+                        if (port > 0 && port < EPHEMERAL_PORT_START) {
+                            ports.add(port);
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // Token looked like addr:port but the port is not a number.
+                    }
+                    break;
+                }
+            }
+        }
+        return ports;
+    }
+
+    private static String joinPorts(Set<Integer> ports) {
+        return String.join(", ", ports.stream().map(String::valueOf).toList());
     }
 
     private SshWaitResult waitForReboot(Job job, String host, String bootIdBefore, String attemptPrefix) {
@@ -2333,6 +2415,7 @@ public final class DnfUpdateApp {
             boolean makecache,
             boolean skipBroken,
             boolean dryRun,
+            boolean lenientHealth,
             String technicalAccountName
     ) {
     }
@@ -2995,6 +3078,7 @@ public final class DnfUpdateApp {
                         <label class="check"><input type="checkbox" name="skipBroken"> Add --skip-broken</label>
                         <label class="check"><input id="dryRun" type="checkbox" name="dryRun"> Dry run report only</label>
                         <label class="check"><input type="checkbox" name="reboot" checked> Reboot after update</label>
+                        <label class="check"><input type="checkbox" name="lenientHealth"> Any HTTP response counts as service up</label>
                         <button id="runButton" type="submit">Start Update</button>
                       </form>
                     </section>
