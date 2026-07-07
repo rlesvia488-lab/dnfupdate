@@ -1052,13 +1052,16 @@ public final class DnfUpdateApp {
                 job.add(host, "warn", "Linux boot ID could not be confirmed. Continuing with SSH reachability as the machine-up check.");
             }
 
-            job.add(host, "info", "Setting SELinux to permissive mode and restarting fabio after reboot.");
+            job.add(host, "info", "Setting SELinux to permissive mode after reboot.");
             runRemote(job, host, verificationSession, "sudo -n setenforce 0", true);
-            runRemote(job, host, verificationSession, "sudo -n systemctl restart fabio");
 
-            job.add(host, "info", "Enabling and starting otelcol-contrib.service after reboot.");
-            runRemote(job, host, verificationSession, "sudo -n systemctl enable otelcol-contrib.service");
-            runRemote(job, host, verificationSession, "sudo -n systemctl start otelcol-contrib.service");
+            job.add(host, "info", "Restarting fabio after reboot (skipped when not installed).");
+            runPostRebootServiceSetup(job, host, verificationSession, "fabio.service",
+                    "sudo -n systemctl restart fabio");
+
+            job.add(host, "info", "Enabling and starting otelcol-contrib.service after reboot (skipped when not installed).");
+            runPostRebootServiceSetup(job, host, verificationSession, "otelcol-contrib.service",
+                    "sudo -n systemctl enable otelcol-contrib.service; sudo -n systemctl start otelcol-contrib.service");
 
             Optional<String> workingHealthcheck = waitForHealthyService(job, host, verificationSession, portsBefore);
             if (workingHealthcheck.isPresent()) {
@@ -1079,6 +1082,24 @@ public final class DnfUpdateApp {
             if (verificationSession != null) {
                 verificationSession.disconnect();
             }
+        }
+    }
+
+    private void runPostRebootServiceSetup(Job job, String host, Session session, String unit, String setupCommands) {
+        String command = "if systemctl list-unit-files " + unit + " --no-legend 2>/dev/null | grep -q .; then "
+                + setupCommands + "; else echo '" + unit + " is not installed; skipping'; fi";
+        try {
+            RemoteResult result = runRemote(job, host, session, command, true);
+            if (result.exitStatus() != 0) {
+                job.add(host, "warn", "Post-reboot setup for " + unit + " failed (exit " + result.exitStatus()
+                        + "); continuing with service verification anyway.");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            job.add(host, "warn", "Post-reboot setup for " + unit + " was interrupted; continuing with service verification anyway.");
+        } catch (Exception e) {
+            job.add(host, "warn", "Post-reboot setup for " + unit + " failed: " + cleanMessage(e)
+                    + "; continuing with service verification anyway.");
         }
     }
 
